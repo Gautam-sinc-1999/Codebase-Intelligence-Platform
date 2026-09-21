@@ -1,0 +1,30 @@
+# ── Web framework ────────────────────────────────────────────
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+
+# ── Datastores ───────────────────────────────────────────────
+chromadb>=0.4.0
+pymongo>=4.4.0
+motor>=3.3.0          # async MongoDB driver — core/database.py:165
+neo4j>=5.10.0
+redis>=5.0.0          # async Redis client — core/database.py:221
+networkx>=3.0         # in-memory graph fallback — graph/neo4j_client.py:3 (imported unconditionally)
+
+# ── Parsing ──────────────────────────────────────────────────
+# Real syntax trees for JS/TS/JSX/TSX/Java. Without these the parser falls back to regex,
+# whose line ranges are approximations rather than actual definition extents.
+tree-sitter>=0.23.0
+tree-sitter-language-pack>=0.7.0
+
+# ── Retrieval ────────────────────────────────────────────────
+rank-bm25>=0.2.2
+
+# ── HTTP ─────────────────────────────────────────────────────
+# Note: .env is parsed by hand in core/config.py, so python-dotenv is not needed.
+httpx>=0.24.1
+
+# ── Test ─────────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-asyncio>=0.21.0

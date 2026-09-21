@@ -1,0 +1,58 @@
+# ── Secrets ──────────────────────────────────────────────────
+# Never commit. .env.example is the tracked template.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+
+# ── Uploaded repositories & generated indexes ────────────────
+# Contains third-party source code and their secrets. Never commit.
+backend/data/
+data/
+chroma_db/
+*.sqlite3
+
+# ── Python ───────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ── Node / frontend ──────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ── Editors & OS ─────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Logs & scratch ───────────────────────────────────────────
+*.log
+tmp/
+.tmp/

@@ -1,0 +1,975 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{color-scheme:light dark}
+  html,body{margin:0}
+  img{max-width:100%}
+  [hidden]{display:none!important}
+</style>
+<title>Codebase Intelligence Internals</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<style>
+:root{
+  --ink:#090d16; --slate:#111827; --slate-2:#1e293b;
+  --paper:#f5f6f9; --paper-2:#ffffff;
+  --indigo:#4f46e5; --cyan:#0891b2; --emerald:#059669; --rose:#e11d48; --amber:#b45309;
+
+  --bg:var(--paper); --surface:var(--paper-2); --surface-2:#eceef3;
+  --fg:#0d1220; --fg-2:#454e63; --fg-3:#6b7488;
+  --rule:#d8dce5; --rule-soft:#e6e9ef;
+  --accent:var(--indigo); --accent-soft:rgba(79,70,229,.09);
+  --code-bg:#f0f2f7;
+
+  --sans:'IBM Plex Sans',system-ui,-apple-system,sans-serif;
+  --serif:'IBM Plex Serif',Georgia,serif;
+  --mono:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:var(--ink); --surface:var(--slate); --surface-2:var(--slate-2);
+    --fg:#eef1f7; --fg-2:#a7b0c2; --fg-3:#79839a;
+    --rule:#23293a; --rule-soft:#1a1f2d;
+    --accent:#818cf8; --accent-soft:rgba(129,140,248,.12);
+    --indigo:#818cf8; --cyan:#22d3ee; --emerald:#34d399; --rose:#fb7185; --amber:#fbbf24;
+    --code-bg:#0e131f;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:var(--ink); --surface:var(--slate); --surface-2:var(--slate-2);
+  --fg:#eef1f7; --fg-2:#a7b0c2; --fg-3:#79839a;
+  --rule:#23293a; --rule-soft:#1a1f2d;
+  --accent:#818cf8; --accent-soft:rgba(129,140,248,.12);
+  --indigo:#818cf8; --cyan:#22d3ee; --emerald:#34d399; --rose:#fb7185; --amber:#fbbf24;
+  --code-bg:#0e131f;
+}
+
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--sans);line-height:1.62;
+  -webkit-font-smoothing:antialiased;padding-block:0;padding-left:20px;padding-right:20px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:200px minmax(0,1fr);gap:56px;align-items:start}
+
+/* ---------- rail ---------- */
+nav{position:sticky;top:0;padding-block:40px;display:flex;flex-direction:column;gap:2px;font-size:.78rem}
+nav .navtitle{font-family:var(--mono);font-size:.66rem;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--fg-3);margin-bottom:12px}
+nav a{color:var(--fg-2);text-decoration:none;padding:4px 0 4px 11px;border-left:2px solid var(--rule-soft);
+  transition:color .15s,border-color .15s}
+nav a:hover,nav a:focus-visible{color:var(--accent);border-left-color:var(--accent)}
+nav a .n{font-family:var(--mono);color:var(--fg-3);margin-right:7px;font-size:.72rem}
+
+main{padding-block:40px 96px;min-width:0}
+
+/* ---------- masthead ---------- */
+.mast{border-bottom:1px solid var(--rule);padding-bottom:30px;margin-bottom:40px}
+.kicker{font-family:var(--mono);font-size:.7rem;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)}
+h1{font-family:var(--serif);font-weight:600;font-size:clamp(2.1rem,4.4vw,3rem);line-height:1.1;
+  text-wrap:balance;margin:12px 0 14px;letter-spacing:-.015em}
+.standfirst{font-size:1.08rem;color:var(--fg-2);max-width:62ch}
+.mast-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px;font-family:var(--mono);font-size:.72rem}
+.mast-meta span{border:1px solid var(--rule);border-radius:3px;padding:3px 9px;color:var(--fg-2)}
+
+/* ---------- sections ---------- */
+section{margin-top:64px;scroll-margin-top:24px}
+h2{font-family:var(--serif);font-weight:600;font-size:1.62rem;letter-spacing:-.01em;text-wrap:balance;
+  margin:0 0 6px;display:flex;align-items:baseline;gap:12px}
+h2 .num{font-family:var(--mono);font-size:.8rem;color:var(--accent);font-weight:500;letter-spacing:.04em}
+h3{font-family:var(--sans);font-weight:600;font-size:1.02rem;margin:34px 0 8px;letter-spacing:-.005em}
+h4{font-family:var(--mono);font-weight:600;font-size:.76rem;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--fg-3);margin:26px 0 8px}
+p{max-width:68ch;margin:0 0 14px;color:var(--fg-2)}
+p strong,li strong{color:var(--fg);font-weight:600}
+.lede{color:var(--fg);font-size:1.02rem}
+ul,ol{max-width:68ch;color:var(--fg-2);padding-left:20px;margin:0 0 14px}
+li{margin-bottom:7px}
+a{color:var(--accent)}
+code{font-family:var(--mono);font-size:.855em;background:var(--code-bg);border:1px solid var(--rule-soft);
+  border-radius:3px;padding:1px 5px;color:var(--fg)}
+
+/* ---------- code blocks ---------- */
+pre{font-family:var(--mono);font-size:.78rem;line-height:1.66;background:var(--code-bg);
+  border:1px solid var(--rule);border-radius:6px;padding:15px 17px;overflow-x:auto;margin:0 0 16px;color:var(--fg)}
+pre .c{color:var(--fg-3)}
+pre .k{color:var(--accent)}
+pre .s{color:var(--emerald)}
+
+/* ---------- tables ---------- */
+.tw{overflow-x:auto;margin:0 0 16px;border:1px solid var(--rule);border-radius:6px}
+table{border-collapse:collapse;width:100%;font-size:.84rem;min-width:520px}
+th{text-align:left;font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--fg-3);font-weight:500;padding:10px 14px;border-bottom:1px solid var(--rule);background:var(--surface-2)}
+td{padding:9px 14px;border-bottom:1px solid var(--rule-soft);color:var(--fg-2);vertical-align:top}
+tr:last-child td{border-bottom:none}
+td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--fg);white-space:nowrap}
+td.m{font-family:var(--mono);font-size:.8rem;color:var(--fg)}
+
+/* ---------- pipeline stages ---------- */
+.stages{display:flex;flex-direction:column;gap:0;margin:22px 0 8px;border-left:2px solid var(--rule);padding-left:0}
+.stage{display:grid;grid-template-columns:60px minmax(0,1fr);gap:20px;padding:18px 0 18px 22px;
+  border-bottom:1px solid var(--rule-soft);position:relative}
+.stage:last-child{border-bottom:none}
+.stage::before{content:"";position:absolute;left:-6px;top:26px;width:10px;height:10px;border-radius:50%;
+  background:var(--accent);border:2px solid var(--bg)}
+.stage .sn{font-family:var(--mono);font-size:1.5rem;font-weight:500;color:var(--accent);line-height:1;
+  font-variant-numeric:tabular-nums}
+.stage .sb h3{margin:0 0 5px;font-size:1rem}
+.stage .sb p{margin:0 0 9px;font-size:.92rem}
+.stage .file{font-family:var(--mono);font-size:.72rem;color:var(--fg-3);margin-top:7px;display:block}
+
+/* ---------- callouts ---------- */
+.note{border-left:3px solid var(--accent);background:var(--accent-soft);padding:13px 16px;border-radius:0 5px 5px 0;
+  margin:0 0 16px;max-width:68ch}
+.note p{margin:0;color:var(--fg-2);font-size:.93rem}
+.note .lbl{font-family:var(--mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--accent);display:block;margin-bottom:5px}
+.warn{border-left-color:var(--amber);background:color-mix(in srgb,var(--amber) 9%,transparent)}
+.warn .lbl{color:var(--amber)}
+
+/* ---------- key/value grid ---------- */
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:1px;background:var(--rule);
+  border:1px solid var(--rule);border-radius:6px;overflow:hidden;margin:0 0 18px}
+.kv > div{background:var(--surface);padding:14px 16px}
+.kv dt{font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--fg-3);margin-bottom:5px}
+.kv dd{margin:0;font-size:.88rem;color:var(--fg-2)}
+.kv dd b{color:var(--fg);font-weight:600;font-family:var(--mono);font-size:.95em}
+
+/* ---------- figure ---------- */
+figure{margin:24px 0;border:1px solid var(--rule);border-radius:8px;background:var(--surface);overflow:hidden}
+figure .fbody{padding:22px 18px;overflow-x:auto}
+figure svg{display:block;max-width:100%;height:auto;margin:0 auto}
+figcaption{font-size:.79rem;color:var(--fg-3);padding:11px 18px;border-top:1px solid var(--rule-soft);
+  background:var(--surface-2);font-family:var(--mono)}
+.svg-l{font-family:'IBM Plex Mono',monospace;font-size:10.5px;fill:var(--fg-2)}
+.svg-t{font-family:'IBM Plex Sans',sans-serif;font-size:12px;font-weight:600;fill:var(--fg)}
+.svg-s{font-family:'IBM Plex Mono',monospace;font-size:9px;fill:var(--fg-3)}
+
+hr{border:none;border-top:1px solid var(--rule);margin:40px 0}
+
+@media (max-width:860px){
+  .wrap{grid-template-columns:1fr;gap:0}
+  nav{position:static;flex-direction:row;flex-wrap:wrap;gap:6px 14px;padding-block:26px 0;
+    border-bottom:1px solid var(--rule)}
+  nav .navtitle{width:100%;margin-bottom:4px}
+  nav a{border-left:none;padding:2px 0}
+  main{padding-block:26px 64px}
+  .stage{grid-template-columns:38px minmax(0,1fr);gap:14px;padding-left:16px}
+  .stage .sn{font-size:1.15rem}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<nav>
+  <div class="navtitle">Contents</div>
+  <a href="#what"><span class="n">01</span>What it is</a>
+  <a href="#arch"><span class="n">02</span>Architecture</a>
+  <a href="#index"><span class="n">03</span>Indexing pipeline</a>
+  <a href="#graph"><span class="n">04</span>The call graph</a>
+  <a href="#retrieval"><span class="n">05</span>Retrieval</a>
+  <a href="#answer"><span class="n">06</span>Answering</a>
+  <a href="#trace"><span class="n">07</span>Tracing a query</a>
+  <a href="#storage"><span class="n">08</span>Storage</a>
+  <a href="#github"><span class="n">09</span>GitHub &amp; drift</a>
+  <a href="#async"><span class="n">10</span>Async &amp; failure</a>
+  <a href="#numbers"><span class="n">11</span>Numbers</a>
+  <a href="#defend"><span class="n">12</span>Defending it</a>
+</nav>
+
+<main>
+<header class="mast">
+  <div class="kicker">System internals · reference</div>
+  <h1>Codebase Intelligence</h1>
+  <p class="standfirst">A conversational RAG system over source code. It parses a repository into
+  symbols, embeds them, builds a call graph across the frontend/backend boundary, and answers
+  questions with citations that point at real line ranges.</p>
+  <div class="mast-meta">
+    <span>FastAPI + React</span><span>8,259 lines backend</span><span>2,447 lines frontend</span>
+    <span>520 tests · 2 graph backends</span>
+  </div>
+</header>
+
+<!-- ============================================ 01 -->
+<section id="what">
+<h2><span class="num">01</span>What it actually does</h2>
+<p class="lede">Four question types, each answered from a different combination of evidence.</p>
+<div class="kv">
+  <div><dt>Feature explanation</dt><dd><b>"How does checkout work?"</b><br>Traces the flow across layers — component → endpoint → service → model.</dd></div>
+  <div><dt>Code location</dt><dd><b>"Where is the discount calculation?"</b><br>Exact file and line range, from the chunk index.</dd></div>
+  <div><dt>Dependency analysis</dt><dd><b>"What calls record_audit?"</b><br>Every call site, read from the graph — not from the snippets.</dd></div>
+  <div><dt>Change impact</dt><dd><b>"If I change this, what breaks?"</b><br>Confirmed callers, affected tests, files to review.</dd></div>
+</div>
+<p>The distinction that matters in an interview: <strong>this is not "embed the files and hope"</strong>.
+Retrieval returns the top <code>k</code> chunks by relevance. For a helper called from fifty places,
+that returns a handful of call sites and the model reports those as the complete set. The static
+analysis knows all fifty, and it is injected into the prompt as authoritative fact.</p>
+</section>
+
+<!-- ============================================ 02 -->
+<section id="arch">
+<h2><span class="num">02</span>Architecture</h2>
+<p>Six layers. The rule that keeps it tractable: <strong>each layer takes a plain data structure
+from the one below and knows nothing about how it was produced.</strong> That is why adding GitHub
+import required no change to parsing, embedding or answering — only a new way to obtain a directory.</p>
+
+<figure>
+<div class="fbody">
+<svg viewBox="0 0 700 396" role="img" aria-label="Layered architecture diagram">
+  <g>
+    <rect x="10" y="10" width="680" height="52" rx="5" fill="none" stroke="var(--rule)"/>
+    <text class="svg-t" x="24" y="32">Interface</text>
+    <text class="svg-l" x="24" y="49">React · Sidebar · ChatWindow · DependencyGraph · RepoUploader · DriftBanner</text>
+  </g>
+  <g>
+    <rect x="10" y="72" width="680" height="52" rx="5" fill="none" stroke="var(--rule)"/>
+    <text class="svg-t" x="24" y="94">API</text>
+    <text class="svg-l" x="24" y="111">FastAPI · repositories · github · conversations · graph — 18 endpoints</text>
+  </g>
+  <g>
+    <rect x="10" y="134" width="680" height="52" rx="5" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+    <text class="svg-t" x="24" y="156">Agent</text>
+    <text class="svg-l" x="24" y="173">intent → retrieve → resolve subject → graph facts → prompt budget → LLM</text>
+  </g>
+  <g>
+    <rect x="10" y="196" width="334" height="52" rx="5" fill="none" stroke="var(--rule)"/>
+    <text class="svg-t" x="24" y="218">Retrieval</text>
+    <text class="svg-l" x="24" y="235">vector + BM25 + symbol · code reranker</text>
+    <rect x="356" y="196" width="334" height="52" rx="5" fill="none" stroke="var(--rule)"/>
+    <text class="svg-t" x="370" y="218">Analysis</text>
+    <text class="svg-l" x="370" y="235">FeatureTracer · ChangeImpactAnalyzer</text>
+  </g>
+  <g>
+    <rect x="10" y="258" width="680" height="52" rx="5" fill="none" stroke="var(--rule)"/>
+    <text class="svg-t" x="24" y="280">Ingestion</text>
+    <text class="svg-l" x="24" y="297">discovery → parse (ast / tree-sitter) → chunk → embed → graph → persist</text>
+  </g>
+  <g>
+    <rect x="10" y="320" width="164" height="52" rx="5" fill="none" stroke="var(--emerald)"/>
+    <text class="svg-t" x="24" y="342">MongoDB</text><text class="svg-s" x="24" y="358">repos · threads</text>
+    <rect x="182" y="320" width="164" height="52" rx="5" fill="none" stroke="var(--cyan)"/>
+    <text class="svg-t" x="196" y="342">ChromaDB</text><text class="svg-s" x="196" y="358">384-d vectors</text>
+    <rect x="354" y="320" width="164" height="52" rx="5" fill="none" stroke="var(--indigo)"/>
+    <text class="svg-t" x="368" y="342">Neo4j</text><text class="svg-s" x="368" y="358">call graph</text>
+    <rect x="526" y="320" width="164" height="52" rx="5" fill="none" stroke="var(--amber)"/>
+    <text class="svg-t" x="540" y="342">Disk</text><text class="svg-s" x="540" y="358">chunk index · manifest</text>
+  </g>
+  <g stroke="var(--fg-3)" stroke-width="1" fill="none">
+    <path d="M350 62 L350 72"/><path d="M350 124 L350 134"/><path d="M350 186 L350 196"/>
+    <path d="M177 248 L177 258"/><path d="M523 248 L523 258"/><path d="M350 310 L350 320"/>
+  </g>
+</svg>
+</div>
+<figcaption>Every store has an in-process fallback. Degraded mode is reported by GET / rather than hidden.</figcaption>
+</figure>
+
+
+<h3>Request block diagram</h3>
+<p>The same six layers, drawn as the path a request actually takes. Solid lines are the request;
+dashed lines are reads from a store.</p>
+
+<figure>
+<div class="fbody">
+<svg viewBox="0 0 720 470" role="img" aria-label="Block diagram of a query travelling through the system">
+  <defs>
+    <marker id="a2" markerWidth="8" markerHeight="8" refX="7" refY="3.2" orient="auto">
+      <path d="M0,0 L6.5,3.2 L0,6.4 Z" fill="var(--fg-3)"/></marker>
+  </defs>
+
+  <rect x="250" y="8" width="220" height="40" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <text class="svg-t" x="360" y="26" text-anchor="middle">Browser</text>
+  <text class="svg-s" x="360" y="40" text-anchor="middle">POST /conversations/{id}/messages</text>
+
+  <rect x="250" y="70" width="220" height="40" rx="5" fill="none" stroke="var(--rule)"/>
+  <text class="svg-t" x="360" y="88" text-anchor="middle">FastAPI route</text>
+  <text class="svg-s" x="360" y="102" text-anchor="middle">loads thread + repository chunks</text>
+
+  <rect x="140" y="132" width="440" height="192" rx="6" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+  <text class="svg-s" x="152" y="150" fill="var(--accent)">ORCHESTRATOR</text>
+
+  <rect x="160" y="160" width="182" height="34" rx="4" fill="none" stroke="var(--rule)"/>
+  <text class="svg-l" x="251" y="181" text-anchor="middle">1 · classify intent</text>
+  <rect x="378" y="160" width="182" height="34" rx="4" fill="none" stroke="var(--cyan)"/>
+  <text class="svg-l" x="469" y="181" text-anchor="middle">2 · hybrid retrieval</text>
+
+  <rect x="160" y="204" width="182" height="34" rx="4" fill="none" stroke="var(--rule)"/>
+  <text class="svg-l" x="251" y="225" text-anchor="middle">3 · resolve subject</text>
+  <rect x="378" y="204" width="182" height="34" rx="4" fill="none" stroke="var(--indigo)"/>
+  <text class="svg-l" x="469" y="225" text-anchor="middle">4 · graph facts</text>
+
+  <rect x="160" y="248" width="400" height="34" rx="4" fill="none" stroke="var(--rule)"/>
+  <text class="svg-l" x="360" y="269" text-anchor="middle">5 · build prompt — budget: facts 25% · history 15% · code remainder</text>
+
+  <rect x="160" y="290" width="400" height="24" rx="4" fill="none" stroke="var(--rule-soft)"/>
+  <text class="svg-s" x="360" y="306" text-anchor="middle">6 · assemble payload: answer + sources + flow + impact + degraded</text>
+
+  <rect x="250" y="346" width="220" height="40" rx="5" fill="none" stroke="var(--emerald)"/>
+  <text class="svg-t" x="360" y="364" text-anchor="middle">LLM provider</text>
+  <text class="svg-s" x="360" y="378" text-anchor="middle">Groq llama-3.3-70b · OpenAI fallback</text>
+
+  <rect x="8" y="408" width="160" height="48" rx="5" fill="none" stroke="var(--cyan)"/>
+  <text class="svg-t" x="88" y="428" text-anchor="middle">ChromaDB</text>
+  <text class="svg-s" x="88" y="444" text-anchor="middle">vector search</text>
+
+  <rect x="188" y="408" width="160" height="48" rx="5" fill="none" stroke="var(--indigo)"/>
+  <text class="svg-t" x="268" y="428" text-anchor="middle">Neo4j</text>
+  <text class="svg-s" x="268" y="444" text-anchor="middle">callers · deps</text>
+
+  <rect x="368" y="408" width="160" height="48" rx="5" fill="none" stroke="var(--amber)"/>
+  <text class="svg-t" x="448" y="428" text-anchor="middle">Disk index</text>
+  <text class="svg-s" x="448" y="444" text-anchor="middle">chunks · BM25</text>
+
+  <rect x="548" y="408" width="164" height="48" rx="5" fill="none" stroke="var(--emerald)"/>
+  <text class="svg-t" x="630" y="428" text-anchor="middle">MongoDB</text>
+  <text class="svg-s" x="630" y="444" text-anchor="middle">thread + turn</text>
+
+  <g stroke="var(--fg-3)" fill="none" stroke-width="1.2">
+    <path d="M360 48 L360 70" marker-end="url(#a2)"/>
+    <path d="M360 110 L360 132" marker-end="url(#a2)"/>
+    <path d="M360 314 L360 346" marker-end="url(#a2)"/>
+  </g>
+  <g stroke="var(--fg-3)" fill="none" stroke-width="1" stroke-dasharray="3 3">
+    <path d="M469 194 L469 200 L120 200 L120 404 L88 404 L88 408" marker-end="url(#a2)"/>
+    <path d="M469 238 L600 238 L600 404 L268 404 L268 408" marker-end="url(#a2)"/>
+    <path d="M300 70 L100 70 L100 390 L448 390 L448 408" marker-end="url(#a2)"/>
+    <path d="M470 366 L640 366 L640 408" marker-end="url(#a2)"/>
+  </g>
+  <text class="svg-s" x="648" y="362">write-through</text>
+</svg>
+</div>
+<figcaption>Solid = request path. Dashed = store access. Every store has an in-process fallback.</figcaption>
+</figure>
+
+<h3>Why four stores and not one</h3>
+<div class="tw"><table>
+<thead><tr><th>Store</th><th>Holds</th><th>Why it can't be merged</th></tr></thead>
+<tbody>
+<tr><td class="m">MongoDB</td><td>repository records, conversations, messages</td><td>The only durable, queryable, multi-instance store. Threads live here because they are the one thing that cannot be regenerated.</td></tr>
+<tr><td class="m">ChromaDB</td><td>384-dim embeddings, one collection per repository</td><td>Semantic similarity needs a vector index; a document store cannot do nearest-neighbour.</td></tr>
+<tr><td class="m">Neo4j</td><td>Symbol/File nodes, CALLS / ROUTES_TO / CONTAINS edges</td><td>Multi-hop traversal ("what transitively depends on X") is a graph query, not a join.</td></tr>
+<tr><td class="m">Disk</td><td>chunk index + content-hash manifest</td><td>The source of truth for citations, and what makes incremental re-index possible.</td></tr>
+</tbody></table></div>
+</section>
+
+<!-- ============================================ 03 -->
+<section id="index">
+<h2><span class="num">03</span>The indexing pipeline</h2>
+<p class="lede">A zip or a clone arrives as a directory. Six stages turn it into something answerable.
+The function at the centre — <code>index_repository_folder(dir, repo_id, name, force_full)</code> —
+takes a plain path and has no idea whether it came from an upload or a <code>git clone</code>.</p>
+
+<div class="stages">
+
+  <div class="stage"><div class="sn">01</div><div class="sb">
+    <h3>Discovery</h3>
+    <p>Walks the tree and decides what is worth reading. Streamed, so only the file being parsed is
+    in memory.</p>
+    <ul>
+      <li><strong>Encoding detection</strong> — BOM first, then a PEP&nbsp;263 <code>coding:</code>
+      declaration, then strict UTF-8, then cp1252/latin-1. A guess is flagged as a guess.</li>
+      <li><strong>Binary check</strong> — null bytes, but a BOM overrides: UTF-16 text is full of
+      nulls and was being discarded as binary.</li>
+      <li><strong>Secret filter</strong> — <code>.env</code>, <code>*.pem</code>, <code>id_rsa</code>,
+      <code>credentials.json</code> are never written to disk, let alone indexed.</li>
+      <li><strong>SHA-256 per file</strong> — the basis of incremental re-index.</li>
+    </ul>
+    <code class="file">app/ingestion/discovery.py · 270 lines</code>
+  </div></div>
+
+  <div class="stage"><div class="sn">02</div><div class="sb">
+    <h3>Parsing</h3>
+    <p>Two parsers, chosen by language. Both emit the same <code>CodeEntity</code> shape, so
+    everything downstream is language-agnostic.</p>
+    <ul>
+      <li><strong>Python</strong> — the stdlib <code>ast</code> module. Recursive scope walking, so
+      nested classes and closures are indexed, not just module-level definitions.</li>
+      <li><strong>JS / TS / JSX / TSX / Java</strong> — tree-sitter. Real syntax trees mean line
+      ranges are actual definition extents rather than regex approximations.</li>
+      <li><strong>Route detection</strong> — FastAPI <code>@router.post("/x")</code>, Flask
+      <code>@app.route(..., methods=[...])</code> (defaulting to GET), Blueprint and APIRouter
+      prefixes. Produces <code>"POST /api/checkout"</code>.</li>
+      <li><strong>Call extraction</strong> — what each symbol calls, and what HTTP requests it issues.</li>
+    </ul>
+    <code class="file">app/ingestion/ast_parser.py · 446 · treesitter_parser.py · 458</code>
+  </div></div>
+
+  <div class="stage"><div class="sn">03</div><div class="sb">
+    <h3>Chunking</h3>
+    <p>One chunk per symbol — a function, method, class or endpoint — carrying its code, its line
+    range and a generated summary line used for embedding.</p>
+<pre><span class="c"># the identity of a chunk</span>
+chunk_id = md5(f<span class="s">"{repo_id}:{file_path}:{symbol}:{start_line}"</span>)</pre>
+    <p>Symbol-level rather than fixed-window is the decision worth defending: a 512-token window
+    splits functions in half and cites line ranges that mean nothing. A chunk here is a thing a
+    developer would point at.</p>
+    <code class="file">app/ingestion/chunker.py · 58 lines</code>
+  </div></div>
+
+  <div class="stage"><div class="sn">04</div><div class="sb">
+    <h3>Embedding</h3>
+    <p><code>all-MiniLM-L6-v2</code> via ONNX, 384 dimensions, one Chroma collection per repository
+    (<code>repo_&lt;id&gt;</code>). This stage is <strong>~89% of indexing time</strong>, which drives
+    almost every performance decision in the system.</p>
+    <p>Only changed chunks are re-embedded — unless a count check shows the collection and the index
+    have diverged, in which case everything is re-embedded rather than leaving semantic search
+    querying a near-empty collection while the index looks complete.</p>
+  </div></div>
+
+  <div class="stage"><div class="sn">05</div><div class="sb">
+    <h3>Graph construction</h3>
+    <p>Call targets are resolved to real symbols, HTTP calls are matched to route handlers, and the
+    result is written as nodes and edges. Covered in detail in <a href="#graph">§04</a>.</p>
+  </div></div>
+
+  <div class="stage"><div class="sn">06</div><div class="sb">
+    <h3>Persistence</h3>
+    <p>Chunks to <code>data/indexes/&lt;repo&gt;.json</code>, file hashes to
+    <code>&lt;repo&gt;.manifest.json</code>, BM25 cache invalidated, status set to
+    <code>ready</code>.</p>
+    <p>The manifest is what makes a re-index cheap: files whose hash is unchanged keep their existing
+    chunks, so a sync after a one-file commit re-parses one file.</p>
+  </div></div>
+
+</div>
+
+<div class="note"><span class="lbl">Interview point — incremental re-index</span>
+<p>A fresh <code>git clone</code> shares no paths or timestamps with the previous one. Reuse works
+anyway because the manifest compares <strong>content hashes</strong>. Measured: changing 1 of 3
+files re-parsed exactly 1 and reused 2.</p></div>
+
+<div class="note warn"><span class="lbl">Known limitation</span>
+<p><code>start_line</code> is part of <code>chunk_id</code>, so adding a comment at the top of a file
+changes the id of every symbol below it and forces a re-embed. Content-addressed chunks
+(<code>hash(symbol + code)</code>) would fix this and let branches share embeddings — the deferred
+phase-3 design.</p></div>
+</section>
+
+<!-- ============================================ 04 -->
+<section id="graph">
+<h2><span class="num">04</span>The call graph</h2>
+<p>This is what separates the product from pasting files into a chat window, so it is worth being
+precise about.</p>
+
+<h4>Node identity</h4>
+<pre><span class="c">// a node is (repository, file, symbol) — all three</span>
+MERGE (s:Symbol {name: chunk.symbol, file_path: chunk.file_path, repo_id: $repo_id})</pre>
+<p>Keying on the symbol alone merged <code>a/util.py:helper</code> and <code>b/util.py:helper</code>
+into one node — they shared callers, a file path and a line range, and the last one indexed silently
+overwrote the other. Same-named helpers are ordinary code structure, not an edge case.</p>
+
+<h4>Three edge types</h4>
+<div class="tw"><table>
+<thead><tr><th>Edge</th><th>Meaning</th><th>Counts as a caller?</th></tr></thead>
+<tbody>
+<tr><td class="m">CONTAINS</td><td>File → Symbol</td><td>No — a file does not call a function</td></tr>
+<tr><td class="m">CALLS</td><td>Symbol → Symbol, in-process</td><td>Yes</td></tr>
+<tr><td class="m">ROUTES_TO</td><td>Component → endpoint handler, across HTTP</td><td>Yes — invocation over the network is still invocation</td></tr>
+</tbody></table></div>
+
+<h3>The cross-stack chain</h3>
+<p>The piece interviewers tend to find most interesting: a frontend <code>fetch()</code> is matched
+to a backend route by method and path — including path parameters — so dependency analysis crosses
+the HTTP boundary.</p>
+
+<figure>
+<div class="fbody">
+<svg viewBox="0 0 660 176" role="img" aria-label="Cross-stack call chain from a React component through an HTTP route to a backend service">
+  <rect x="8" y="52" width="150" height="56" rx="5" fill="none" stroke="var(--cyan)"/>
+  <text class="svg-t" x="20" y="74">CartComponent</text>
+  <text class="svg-s" x="20" y="92">ui/Cart.jsx:2</text>
+
+  <rect x="248" y="52" width="164" height="56" rx="5" fill="none" stroke="var(--indigo)"/>
+  <text class="svg-t" x="260" y="74">process_checkout</text>
+  <text class="svg-s" x="260" y="92">POST /api/checkout</text>
+
+  <rect x="502" y="52" width="150" height="56" rx="5" fill="none" stroke="var(--emerald)"/>
+  <text class="svg-t" x="514" y="74">charge_card</text>
+  <text class="svg-s" x="514" y="92">api/server.py:9</text>
+
+  <g stroke="var(--fg-3)" fill="none" stroke-width="1.2">
+    <path d="M158 80 L242 80" marker-end="url(#ar)"/>
+    <path d="M412 80 L496 80" marker-end="url(#ar)"/>
+  </g>
+  <defs><marker id="ar" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+    <path d="M0,0 L6,3 L0,6 Z" fill="var(--fg-3)"/></marker></defs>
+  <text class="svg-l" x="163" y="72" fill="var(--cyan)">ROUTES_TO</text>
+  <text class="svg-s" x="163" y="98">fetch(), method POST</text>
+  <text class="svg-l" x="424" y="72" fill="var(--emerald)">CALLS</text>
+  <text class="svg-s" x="424" y="98">in-process</text>
+
+  <text class="svg-s" x="8" y="148">Asking "what depends on charge_card?" reaches CartComponent in two hops,</text>
+  <text class="svg-s" x="8" y="163">across a network boundary no text search would have crossed.</text>
+</svg>
+</div>
+<figcaption>Verified live: a Flask app and a JSX component indexed together produce exactly this chain.</figcaption>
+</figure>
+
+<h4>Multi-method routes</h4>
+<p><code>@app.route("/items", methods=["GET","POST"])</code> becomes the single route string
+<code>"DELETE|GET|POST /items"</code> and the handler is indexed under each verb. <strong>One handler
+stays one node</strong> — emitting one entity per method would split the call graph across nodes
+covering identical lines.</p>
+</section>
+
+<!-- ============================================ 05 -->
+<section id="retrieval">
+<h2><span class="num">05</span>Retrieval</h2>
+<p class="lede">Three signals are fused, then a code-aware reranker decides which candidate is the
+best <em>answer</em> rather than merely the most relevant.</p>
+
+<h4>Stage 1 — fusion</h4>
+<div class="tw"><table>
+<thead><tr><th>Signal</th><th>Weight</th><th>Catches</th></tr></thead>
+<tbody>
+<tr><td>Vector similarity (Chroma)</td><td class="n">+2.5</td><td>Paraphrase — "how do we bill people" finds <code>charge_card</code></td></tr>
+<tr><td>BM25 keyword</td><td class="n">× 0.1</td><td>Exact terms, rare identifiers</td></tr>
+<tr><td>Exact symbol match</td><td class="n">+3.0</td><td>The user naming a function outright</td></tr>
+<tr><td>Symbol tail match</td><td class="n">+2.0</td><td><code>calculate_discount</code> → <code>DiscountService.calculate_discount</code></td></tr>
+<tr><td>File path match</td><td class="n">+1.5</td><td>"in decide.py"</td></tr>
+</tbody></table></div>
+<p>Semantic search alone fails on rare identifiers; keyword search alone fails on paraphrase. The
+weights encode that an exact symbol name is stronger evidence than semantic proximity.</p>
+
+<h4>Stage 2 — code-aware reranking</h4>
+<p>Fusion says how many signals found a candidate. The reranker applies signals only meaningful for
+code: query-term overlap with the symbol name, coverage, entity type, and <strong>penalties</strong> —
+test files and very large chunks score lower, because "where is X defined" should not return the
+test that exercises it.</p>
+
+<h4>Subject resolution</h4>
+<p>Separate from retrieval, and a genuinely subtle part. Retrieval rank answers <em>what is
+relevant</em>, not <em>what did you name</em>:</p>
+<ol>
+  <li>A symbol the user named explicitly (backticks outrank bare words)</li>
+  <li>A file or module they named — <code>decide.py</code>, "the decide module"</li>
+  <li>The conversation's current subject, when the query refers back ("who calls it?")</li>
+  <li>Only then, the top-ranked hit</li>
+</ol>
+<p>Without step 2, "if I change the decide module, what breaks?" matched nothing, fell through to
+rank, and produced an impact report about a helper in a test file.</p>
+</section>
+
+<!-- ============================================ 06 -->
+<section id="answer">
+<h2><span class="num">06</span>Answering</h2>
+
+<h4>Intent classification</h4>
+<p>Whole-word token-sequence matching with scoring — not substring containment. The old version
+matched <code>"change"</code> inside <code>"unchanged"</code>:</p>
+<pre>"Which parts are unchanged?"          → CHANGE_IMPACT      <span class="c">('unchanged' ⊃ 'change')</span>
+"Is the parser independent of X?"     → DEPENDENCY_ANALYSIS <span class="c">('independent' ⊃ 'depend')</span>
+"Describe the workflow engine"        → FEATURE_EXPLANATION <span class="c">('workflow' ⊃ 'flow')</span></pre>
+<p>Each intent is scored and the best wins; a two-word phrase scores its own length, so
+<code>"who calls"</code> outranks a lone <code>"flow"</code>. Measured on a 18-question set:
+<strong>10/18 → 18/18</strong>.</p>
+
+<h3>Static analysis facts in the prompt</h3>
+<p>The single most important design decision. The graph was being built, queried and rendered — and
+the answer generated from snippets alone, so the panel and the prose could disagree inside one
+response.</p>
+<pre><span class="k">STATIC ANALYSIS FACTS</span> (authoritative — from the parsed call graph, not the snippets):
+
+CALLERS OF `record_audit` (13 total) — this list is complete; do not describe
+it as partial or as examples:
+  - `handle_request` in api/handlers.py:3
+  - `operation_1` in services/module_1.py:3
+  ...
+
+<span class="c">These facts were computed by walking the syntax trees and call graph. Where a
+snippet below appears to disagree, the facts above are correct — the snippets
+are an excerpt, not the whole repository.</span></pre>
+<p>Placed <strong>before</strong> the code, because the snippet block can be long and anything after
+it competes for attention. Measured on a helper called from 13 files where retrieval surfaced 5:
+the answer went from naming <strong>5 of 13</strong> — presented as complete — to <strong>13 of
+13</strong>, with the correct count in the prose.</p>
+
+<h4>Prompt budgeting</h4>
+<p>A prompt that consumes the whole per-minute token budget does not fail outright — it succeeds once
+and rate-limits everything for the next minute. The budget is allocated, not assumed:</p>
+<div class="tw"><table>
+<thead><tr><th>Section</th><th>Share</th><th>Rationale</th></tr></thead>
+<tbody>
+<tr><td>System prompt</td><td class="n">fixed</td><td>Counted against the budget, not ignored</td></tr>
+<tr><td>Static analysis facts</td><td class="n">25%</td><td>Authoritative but compact; capped in aggregate across all blocks</td></tr>
+<tr><td>History</td><td class="n">15%</td><td>Only resolves references; oldest turns dropped first</td></tr>
+<tr><td>Retrieved code</td><td class="n">remainder</td><td>What stops the model inventing behaviour — so it gets what is left</td></tr>
+</tbody></table></div>
+<p>Worst case measured: <strong>7,255 → 3,006 tokens</strong> against an 8,000 TPM limit.</p>
+
+<h4>Honest degradation</h4>
+<p>When no model is reachable, a rule-based template answers from the retrieved chunks. It cites real
+files and line ranges — it is simply not <em>equivalent</em>. The response carries
+<code>degraded: true</code> and the UI says so, rather than presenting a visibly poorer answer with
+no explanation.</p>
+</section>
+
+
+<!-- ============================================ 07 -->
+<section id="trace">
+<h2><span class="num">07</span>Tracing a query end to end</h2>
+<p class="lede">One real query, instrumented. Every figure below was measured on the running
+system — not a sketch of what it would do.</p>
+
+<pre>Query:  <span class="s">"What depends on calculate_discount?"</span>
+Repo:   sample_ecommerce_repo — 8 files, 18 chunks, 26 graph nodes</pre>
+
+<h4>Stage timings</h4>
+<div class="tw"><table>
+<thead><tr><th>#</th><th>Stage</th><th>Time</th><th>What came out</th></tr></thead>
+<tbody>
+<tr><td class="m">1</td><td>Load chunk index</td><td class="n">47.8 ms</td><td>18 chunks from <code>data/indexes/…json</code>, cached in-process</td></tr>
+<tr><td class="m">2</td><td>Classify intent</td><td class="n">0.1 ms</td><td><code>DEPENDENCY_ANALYSIS</code>, confidence 0.92</td></tr>
+<tr><td class="m">3</td><td>Hybrid retrieval</td><td class="n">350.4 ms</td><td>6 chunks — vector + BM25 + symbol, then reranked</td></tr>
+<tr><td class="m">4</td><td>Resolve subject</td><td class="n">0.1 ms</td><td><code>DiscountService.calculate_discount</code></td></tr>
+<tr><td class="m">5</td><td>Graph query</td><td class="n">9.6 ms</td><td><strong>4 callers</strong> — Cypher against Neo4j</td></tr>
+<tr><td class="m">6</td><td>Build prompt</td><td class="n">835.1 ms</td><td>1,739 char system + 5,746 char user turn</td></tr>
+<tr><td class="m">7</td><td>LLM + assemble</td><td class="n">2,577.9 ms</td><td>830 char answer, <code>degraded: false</code></td></tr>
+</tbody></table></div>
+<p><strong>The shape to notice:</strong> the model is 68% of the wall clock. Everything this system
+does to make the answer correct — retrieval, graph traversal, prompt construction — costs about
+1.2&nbsp;s combined. That is why the write path was never worth optimising and why the prompt
+<em>budget</em> matters more than prompt speed.</p>
+
+<h3>What goes into the model</h3>
+<p>Two messages: a system prompt that never varies, and a user turn assembled per query. Here is the
+real thing, trimmed only where marked.</p>
+
+<h4>Message 1 — system prompt (1,739 chars, constant)</h4>
+<pre>You are a helpful, senior software engineer pair-programming with a developer
+onboarding to a codebase.
+
+<span class="k">GROUNDING RULES</span> (these override style):
+A.  Answer ONLY from the material in the user turn: the Static Analysis Facts
+    and the Retrieved Code Context.
+A1. The Static Analysis Facts are <span class="k">AUTHORITATIVE and COMPLETE</span> for what they
+    state. The snippets are the top matches for this question, not the whole
+    repository, so they will often show fewer call sites than the facts list.
+    When the two appear to disagree, follow the facts. Never describe a list
+    given in the facts as partial, as 'examples', or as 'a handful' — report it
+    as the complete set it is, and give the count.
+B.  Never invent file paths, symbol names, line numbers, or behaviour that is
+    not visible in that context.
+C.  When you cite a location, use the exact path and line range shown.
+
+<span class="k">STYLE</span>: conversational first · 2-4 sentence summary · name key files naturally
+· offer two follow-ups · answer follow-ups directly.</pre>
+<p><strong>Rule A1 is the whole product in one paragraph.</strong> Without it the model averages two
+sources that disagree — and the snippets, being longer and more concrete, tend to win.</p>
+
+<h4>Message 2 — user turn (5,746 chars, built per query)</h4>
+<pre>User Question: What depends on calculate_discount?
+Active Feature Context: calculate_discount
+
+<span class="k">STATIC ANALYSIS FACTS</span> (authoritative — derived from the parsed call graph,
+not from the snippets below):
+CALLERS OF `DiscountService.calculate_discount` — every call site in the
+repository <span class="k">(4 total)</span> — this list is complete; do not describe it as
+partial or as examples:
+  - `test_welcome10_coupon` in tests/test_discount.py:4
+  - `test_summer20_coupon` in tests/test_discount.py:9
+  - `test_loyalty_tier_discount` in tests/test_discount.py:14
+  - `process_checkout` in backend/api/checkout_controller.py:25
+
+<span class="c">These facts were computed by walking the repository's syntax trees and call
+graph. They are complete for what they state. Where a snippet below appears to
+disagree, the facts above are correct — the snippets are an excerpt, not the
+whole repository.</span>
+
+Retrieved Code Context (verbatim from the indexed repository):
+
+--- backend/services/discount_service.py lines 15-33
+    (symbol: DiscountService.calculate_discount, type: method) ---
+```python
+def calculate_discount(self, user_id: str, subtotal: float,
+                       coupon_code: Optional[str] = None) -&gt; float:
+    """Calculates total discount for an order."""
+    if subtotal &lt;= 0:
+        return 0.0
+    discount = 0.0
+    if coupon_code and coupon_code.upper() in self.COUPON_DATABASE:
+        discount = subtotal * self.COUPON_DATABASE[coupon_code.upper()]
+    if subtotal &gt;= 100.0 and not coupon_code:
+        discount = max(discount, subtotal * 0.05)
+    return round(discount, 2)
+```
+
+--- backend/services/discount_service.py lines 3-37
+    (symbol: DiscountService, type: class) ---
+<span class="c">… 5 more chunks, newest-relevance-first until the budget is spent …</span></pre>
+
+<div class="note"><span class="lbl">Order is deliberate</span>
+<p>Facts come <strong>before</strong> the code. The snippet block runs to several thousand
+characters, and anything placed after it competes for attention with a wall of source. The header
+line above each snippet is what rule C tells the model to cite from — which is how citations end up
+pointing at real line ranges.</p></div>
+
+<h3>What comes back</h3>
+<p>The model returns prose. The endpoint returns a structured payload of which prose is one field —
+the rest is computed, not generated, so the UI can render panels the model cannot fabricate.</p>
+
+<h4>The answer (830 chars, verbatim)</h4>
+<pre>`calculate_discount` is used in four places across the codebase:
+
+| Caller                     | File                                  | Location |
+|----------------------------|---------------------------------------|----------|
+| `test_welcome10_coupon`    | `tests/test_discount.py`              | line 4   |
+| `test_summer20_coupon`     | `tests/test_discount.py`              | line 9   |
+| `test_loyalty_tier_discount` | `tests/test_discount.py`            | line 14  |
+| `process_checkout`         | `backend/api/checkout_controller.py`  | line 25  |
+
+So the discount-calculation logic is exercised by three unit-test functions and
+by the checkout endpoint that applies the discount when a user completes an order.
+
+**What would you like to explore next?**
+1. See the exact lines where each caller invokes `calculate_discount`.
+2. Get a full execution flow from the checkout request through discount
+   calculation to order creation.</pre>
+<p><strong>Four of four, with the count stated.</strong> The model did not count them — the graph
+did, and the prompt said so. That is the difference between an answer that is right and one that
+happens to be right.</p>
+
+<h4>The response payload</h4>
+<pre>{
+  "conversation_id":  "conv_…",
+  "repository_id":    "sample_ecommerce_repo",
+  "intent":           "DEPENDENCY_ANALYSIS",   <span class="c">// from the classifier, not the model</span>
+  "answer":           "…markdown…",            <span class="c">// the only generated field</span>
+  "sources":          [ 6 × {file_path, symbol, start_line, end_line,
+                             entity_type, language, code_snippet} ],
+  "execution_flow":   {},                      <span class="c">// FEATURE_EXPLANATION only</span>
+  "impact_analysis":  {},                      <span class="c">// CHANGE_IMPACT only</span>
+  "degraded":         false,                   <span class="c">// true ⇒ template, not a model</span>
+  "degraded_reason":  null,
+  "working_context":  {current_feature, current_symbol, relevant_files}
+}</pre>
+
+<h4>What is stored afterwards</h4>
+<pre>conversations            message_count 0 → 2, title ← first question,
+                         summary, working_context, indexed_commit_sha
+conversation_messages    seq 0  {role: user,      content}
+                         seq 1  {role: assistant, content, intent, sources,
+                                 execution_flow, impact_analysis, degraded}</pre>
+<p>The stored <code>sources</code> are <strong>pointers only</strong> —
+<code>(file_path, symbol, start_line, end_line)</code> — with the code stripped. Expanding a citation
+after a reload calls <code>GET /repositories/{id}/snippet</code> to resolve the pointer back to
+source. One measured turn held 306&nbsp;KB of inlined code, 98% of the stored message, of which the
+UI rendered about 1&nbsp;KB.</p>
+
+<h3>The same query, three ways</h3>
+<p>Worth knowing for an interview: the intent changes which analysis runs, which changes what
+reaches the model.</p>
+<div class="tw"><table>
+<thead><tr><th>Intent</th><th>Extra analysis</th><th>Added to the prompt</th></tr></thead>
+<tbody>
+<tr><td class="m">DEPENDENCY_ANALYSIS</td><td>graph callers + 2-hop dependencies</td><td>Complete caller list with a count</td></tr>
+<tr><td class="m">CHANGE_IMPACT</td><td><code>ChangeImpactAnalyzer</code></td><td>Change target, confirmed callers, affected tests, files to review</td></tr>
+<tr><td class="m">FEATURE_EXPLANATION</td><td><code>FeatureTracer</code></td><td>Numbered flow steps across layers, with file:line for each</td></tr>
+<tr><td class="m">CODE_LOCATION</td><td>callers only</td><td>Caller list — the answer is mostly the snippet headers</td></tr>
+</tbody></table></div>
+</section>
+
+<!-- ============================================ 08 -->
+<section id="storage">
+<h2><span class="num">08</span>Storage &amp; conversation memory</h2>
+
+<h4>What lives where</h4>
+<pre>MongoDB
+  repositories           repository_id, name, source, branch, commit_sha, languages
+  conversations          one doc per thread — title, summary, working_context, counters
+  conversation_messages  one doc per message, ordered by an explicit `seq`
+
+ChromaDB   repo_&lt;id&gt;               384-d vectors
+Neo4j      Symbol / File nodes     CALLS · ROUTES_TO · CONTAINS
+Disk       data/indexes/&lt;id&gt;.json  chunks + code · .manifest.json = file hashes</pre>
+
+<h3>Why two collections, not one document</h3>
+<p>A thread has no natural size ceiling. One document with an embedded message array would approach
+Mongo's 16&nbsp;MB limit and force every read to pull the entire history when the UI wants the last
+twenty turns. Splitting them keeps <code>read_messages(limit=20)</code> cheap.</p>
+<p><code>seq</code> rather than a timestamp, because two turns saved in the same millisecond must
+still come back in order.</p>
+
+<h3>Write-through, not write-behind</h3>
+<p>Conversations are written to Mongo synchronously on every turn. The alternative — buffering in
+Redis and checkpointing — was measured and rejected:</p>
+<div class="kv">
+  <div><dt>Mongo insert</dt><dd><b>0.155 ms</b></dd></div>
+  <div><dt>Redis RPUSH</dt><dd><b>0.087 ms</b></dd></div>
+  <div><dt>One LLM turn</dt><dd><b>2,000–8,000 ms</b></dd></div>
+  <div><dt>Write as share of a turn</dt><dd><b>0.005%</b></dd></div>
+</div>
+<p>There is no bottleneck to buffer, and a checkpoint window would put <strong>the only
+non-regenerable data in the system</strong> behind a lossy cache to save 0.068&nbsp;ms. Indexes,
+embeddings and graphs all rebuild from source in seconds; a conversation exists nowhere else.</p>
+
+<h4>Citations are pointers, not payloads</h4>
+<p>A stored turn keeps <code>(file_path, symbol, start_line, end_line)</code> — not the code. One
+measured message held 306&nbsp;KB of inlined source, 98% of the stored turn, of which the UI rendered
+about 1&nbsp;KB.</p>
+<p>The other half of that trade is <code>GET /repositories/{id}/snippet</code>, which resolves a
+pointer back to source when the reader expands a citation. Without it the code viewer worked during a
+live session and silently went inert after a reload.</p>
+</section>
+
+<!-- ============================================ 09 -->
+<section id="github">
+<h2><span class="num">09</span>GitHub import &amp; drift</h2>
+<p>The whole feature rests on one observation: <strong>the zip path is
+<code>extract → directory → index</code>; git is <code>clone → directory → index</code></strong>.
+Only acquisition changes.</p>
+
+<h4>Derived identity</h4>
+<pre>repository_id = "gh_" + sha256("github.com/owner/repo@branch")[:12]</pre>
+<p>Stable across syncs, distinct per branch, case-insensitive like GitHub itself. A zip upload mints
+a fresh uuid, so uploading twice makes two unrelated repositories — wrong for something with an
+upstream.</p>
+
+<h4>A URL is hostile input</h4>
+<p>A clone is remote-controlled disk writing. Validation is a pure function, tested directly:</p>
+<div class="tw"><table>
+<thead><tr><th>Rejected</th><th>Because</th></tr></thead>
+<tbody>
+<tr><td class="m">file:///etc/passwd</td><td>A perfectly valid clone URL that reads local disk</td></tr>
+<tr><td class="m">https://github.com@evil.com/a/b</td><td>Userinfo — the real host is <code>evil.com</code></td></tr>
+<tr><td class="m">https://user:token@github.com/…</td><td>Credentials leak into <code>ps</code> and logs</td></tr>
+<tr><td class="m">github.com.evil.com</td><td>Suffix impersonation</td></tr>
+<tr><td class="m">--upload-pack=touch /tmp/x</td><td>Reads as a git option, not a URL</td></tr>
+</tbody></table></div>
+<p>Defence in depth: <code>--</code> before every argument so nothing can be read as a flag,
+<code>GIT_TERMINAL_PROMPT=0</code> so a private repo fails fast instead of blocking on a credential
+prompt, and <code>GIT_ALLOW_PROTOCOL=https</code> so git itself refuses anything else.</p>
+
+<h3>Drift detection — three states, not two</h3>
+<p>A thread is a conversation about a <em>specific version</em> of the code. The obvious comparison is
+index vs remote, but a third case appears the moment one repository has two threads:</p>
+<div class="tw"><table>
+<thead><tr><th>State</th><th>Means</th><th>Offers a sync?</th></tr></thead>
+<tbody>
+<tr><td class="m">current</td><td>Nothing changed</td><td>—</td></tr>
+<tr><td class="m">behind</td><td>Upstream moved</td><td>Yes</td></tr>
+<tr><td class="m">thread_behind</td><td>Another thread already synced this repo</td><td><strong>No</strong> — there is nothing to pull</td></tr>
+</tbody></table></div>
+
+<h4>Aged citations</h4>
+<p>After a sync, an old pointer still resolves — against different code. A citation recorded as
+<code>checkout.py:40-58</code> may now be a different function, and the viewer would show it with
+complete confidence.</p>
+<p>Pinning each thread to its own index would be exact and unaffordable: indexing every commit of a
+500-commit repository is roughly 428,500 chunks and ~16&nbsp;GB. So the answer is <strong>label, do
+not pin</strong> — each turn records the SHA it was answered at, and <code>/snippet?at_sha=</code>
+returns <code>stale: true</code> when they differ.</p>
+</section>
+
+<!-- ============================================ 10 -->
+<section id="async">
+<h2><span class="num">10</span>Async work &amp; failure handling</h2>
+
+<h3>Why shutdown waits instead of cancelling</h3>
+<p>The subtlest bug in the system, and a good interview answer.</p>
+<p><code>run_in_executor</code> hands work to an OS thread. <strong>Cancelling the awaitable returns
+immediately while the thread keeps running</strong> — it is not interruptible. A shutdown that
+cancels therefore reports a clean stop while a live thread is still writing embeddings to ChromaDB
+and nodes to Neo4j. Closing the vector store at that point tears the client out from under a live
+upsert.</p>
+<pre><span class="c"># drain() waits. It does not cancel.</span>
+done, still_running = <span class="k">await</span> asyncio.wait(pending, timeout=timeout)
+self._executor.shutdown(wait=<span class="k">True</span>)   <span class="c"># the guarantee</span></pre>
+<p>The test asserts not that <code>drain()</code> returned, but that <em>the worker thread's final
+statement ran</em> before it did.</p>
+
+<h4>Where the async boundary falls on upload</h4>
+<p>The uploaded stream exists only for the duration of the request, so saving and extracting the
+archive happens inline; indexing is the slow half and becomes the job. A corrupt or hostile archive
+therefore still fails <strong>synchronously with a 400</strong> — the right answer for a request that
+was never going to work — while a valid one returns <code>202</code> in 0.07&nbsp;s.</p>
+
+<h4>Failure cleanup</h4>
+<p>Indexing writes embeddings <em>before</em> it builds the graph, so a failure in between stranded a
+populated Chroma collection owned by a repository Mongo never recorded — invisible and unreachable.
+Every failure path now purges all six places a repository lives.</p>
+<div class="note"><span class="lbl">Deliberate asymmetry</span>
+<p>A failed <strong>import</strong> deletes its record: a row that cannot answer anything is worse
+than no row. A failed <strong>sync</strong> keeps it: the repository already worked and its previous
+index is still answerable, so a network hiccup should not destroy it.</p></div>
+</section>
+
+<!-- ============================================ 11 -->
+<section id="numbers">
+<h2><span class="num">11</span>Numbers worth remembering</h2>
+<p>All measured on this system, not estimated.</p>
+<div class="tw"><table>
+<thead><tr><th>Operation</th><th>Cost</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Index <code>psf/requests</code> (109 files)</td><td class="n">41 s</td><td>865 chunks, 947 graph nodes, ~89% embedding</td></tr>
+<tr><td><code>git ls-remote --heads</code></td><td class="n">1.08 s</td><td>No clone, no auth for public repos</td></tr>
+<tr><td>Branch list, cached</td><td class="n">0.004 s</td><td>5-minute TTL</td></tr>
+<tr><td><code>POST /from-github</code> → 202</td><td class="n">0.00 s</td><td>When the branch is supplied</td></tr>
+<tr><td><code>POST /upload</code> → 202</td><td class="n">0.07 s</td><td>vs 7.0 s held open before</td></tr>
+<tr><td>Sync, nothing moved</td><td class="n">0.94 s</td><td>One ls-remote, no clone</td></tr>
+<tr><td>Drift check, git repo</td><td class="n">1.03 s</td><td>Cached 5 min</td></tr>
+<tr><td>Drift check, zip repo</td><td class="n">0.006 s</td><td>No upstream — no network call at all</td></tr>
+<tr><td>Mongo write per turn</td><td class="n">0.155 ms</td><td>0.005% of an LLM turn</td></tr>
+<tr><td>Thread listing, 500 threads</td><td class="n">1.6 ms</td><td>vs 10.3 ms reading 500 files</td></tr>
+<tr><td>Full test suite</td><td class="n">~75 s</td><td>520 tests, run on both graph backends</td></tr>
+</tbody></table></div>
+</section>
+
+<!-- ============================================ 12 -->
+<section id="defend">
+<h2><span class="num">12</span>Defending the design</h2>
+<p class="lede">The questions most likely to be asked, and the honest answer to each.</p>
+
+<h3>"Why not just embed the files?"</h3>
+<p>Retrieval returns top-<code>k</code>. For a widely-used helper it returns a handful of call sites
+and the model reports those as complete. Measured: the graph knew 13 callers, retrieval surfaced 5,
+and the answer said <em>"In the current codebase the callers are:"</em> — then listed five. Static
+analysis is what makes a dependency answer correct rather than plausible.</p>
+
+<h3>"Why symbol-level chunks instead of a token window?"</h3>
+<p>Because citations have to be actionable. A fixed window splits a function in half and cites a line
+range that corresponds to nothing. A symbol is a thing a developer can open.</p>
+
+<h3>"How do you know it works on a repository you didn't write?"</h3>
+<p>Verified against <code>psf/requests</code> — 865 chunks, 947 nodes — with answers citing
+<code>sessions.py</code>, <code>Session.prepare_request</code> and <code>SessionRedirectMixin</code>.
+Two branches of the same repo were indexed side by side and confirmed isolated: 0 shared chunk ids,
+0 graph edges crossing repositories.</p>
+
+<h3>"What's the weakest part?"</h3>
+<p>Worth having a real answer ready:</p>
+<ul>
+  <li><strong>Chunk ids include <code>start_line</code></strong>, so a comment at the top of a file
+  invalidates every symbol below it. Content-addressed chunks would fix it and let branches share
+  embeddings.</li>
+  <li><strong>Every branch is a full index</strong> — ~857 chunks and ~32&nbsp;MB per branch, with no
+  sharing between branches that are 99% identical.</li>
+  <li><strong>Call resolution is name-based</strong>, not type-aware. Dynamic dispatch and
+  runtime-constructed calls are invisible.</li>
+  <li><strong>The graph view caps at 200 nodes.</strong> It now says so and keeps the most connected
+  ones, but it is still a slice.</li>
+</ul>
+
+<h3>"How is it tested?"</h3>
+<p>520 tests, run against <strong>both graph backends</strong> — Neo4j and the in-memory NetworkX
+fallback. That is not redundancy: running both is what catches the two backends quietly disagreeing,
+which happened three times (label casing, whether the queried symbol appears in its own dependencies,
+and whether <code>max_depth</code> was honoured at all).</p>
+<p>Fixes are mutation-checked — the guard is removed and the suite re-run to confirm a test actually
+fails. Several tests that looked fine were passing by luck, and one such check exposed real
+non-determinism: candidate paths iterated out of a <code>set</code>, so equal-scoring files were
+separated by hash order, which varies between processes.</p>
+</section>
+
+<hr>
+<p style="font-size:.8rem;color:var(--fg-3);font-family:var(--mono);max-width:none">
+Every figure on this page was measured on the running system.</p>
+
+</main>
+</div>
+
+</body>
+</html>

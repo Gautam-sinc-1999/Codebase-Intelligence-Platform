@@ -15,6 +15,7 @@ import os
 import shutil
 import asyncio
 import logging
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
 
@@ -44,6 +45,7 @@ from app.api.repositories import (
     purge_repository_stores,
     indexing_status,
 )
+from app.observability import tracing
 
 logger = logging.getLogger("api.github")
 
@@ -78,19 +80,61 @@ def _clone_and_index(repository_id: str, clone_url: str, branch: str, name: str)
     repository because there is no `storage_path` — is handled by `/sync`, which re-clones.
     """
     destination = _clone_dir(repository_id)
-    try:
-        commit_sha = clone_repository(clone_url, branch, destination)
-        stats = enforce_clone_limits(destination)
-        logger.info(
-            "Cloned %s@%s at %s (%d files, %.1f MB).",
-            name, branch, commit_sha[:12], stats["file_count"], stats["total_bytes"] / 1048576,
-        )
+    with _acquire_trace(repository_id, clone_url, branch, name, "github_import") as trace:
+        try:
+            commit_sha = _clone_with_limits(clone_url, branch, destination, name)
+            result = index_repository_folder(destination, repository_id, name,
+                                             job_id=repository_id, trigger="github_import")
+            result["commit_sha"] = commit_sha
+            trace.update(output={"status": "ok", "commit_sha": commit_sha,
+                                 "files": result["file_count"]})
+            return result
+        except Exception as e:
+            trace.update(output={"status": "failed", "error": str(e)})
+            raise
+        finally:
+            # Inside the trace, so the cost and outcome of removing the working tree are visible.
+            # This is the step that keeps a failed import from leaving a clone on disk, and it is
+            # the one nobody would otherwise notice had stopped happening.
+            with tracing.span("cleanup", input={"path": destination}) as s:
+                shutil.rmtree(destination, ignore_errors=True)
+                s.update(output={"removed": not os.path.isdir(destination)})
 
-        result = index_repository_folder(destination, repository_id, name)
-        result["commit_sha"] = commit_sha
-        return result
-    finally:
-        shutil.rmtree(destination, ignore_errors=True)
+
+@contextmanager
+def _acquire_trace(repository_id: str, clone_url: str, branch: str, name: str, trigger: str):
+    """
+    The root trace for acquiring a repository: clone, size limits, index, cleanup.
+
+    Opened here rather than inherited, for the same reason indexing opens its own — this runs on a
+    `run_in_executor` worker thread, which does not carry the request's context across. The index
+    trace nests underneath automatically, so one trace covers the whole job.
+    """
+    with tracing.start_trace_sync(
+        "acquire",
+        metadata={"repository_id": repository_id, "repository": name, "branch": branch,
+                  "clone_url": clone_url, "trigger": trigger, "job_id": repository_id},
+        tags=["acquire", trigger],
+    ) as trace:
+        yield trace
+
+
+def _clone_with_limits(clone_url: str, branch: str, destination: str, name: str) -> str:
+    """Clones and enforces the size limits, tracing each. Returns the commit sha."""
+    with tracing.span("clone", input={"clone_url": clone_url, "branch": branch}) as s:
+        commit_sha = clone_repository(clone_url, branch, destination)
+        s.update(output={"commit_sha": commit_sha})
+
+    with tracing.span("enforce_limits") as s:
+        stats = enforce_clone_limits(destination)
+        s.update(output={"file_count": stats["file_count"],
+                         "total_bytes": stats["total_bytes"]})
+
+    logger.info(
+        "Cloned %s@%s at %s (%d files, %.1f MB).",
+        name, branch, commit_sha[:12], stats["file_count"], stats["total_bytes"] / 1048576,
+    )
+    return commit_sha
 
 
 @router.get("/github/branches")
@@ -147,32 +191,50 @@ async def import_from_github(request: GitHubImportRequest):
     importing the same branch twice updates one repository instead of creating two unrelated
     copies of it — which is what a zip upload does, and is wrong for something with an upstream.
     """
-    try:
-        repo_ref = validate_github_url(request.url)
-    except InvalidRepositoryURL as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    # Traced separately from the import itself: this part happens inside the request, before the
+    # 202, while the clone happens on a worker thread afterwards. They are different lifetimes, so
+    # they are different traces — and this is the one that shows a rejected paste or a slow GitHub.
+    async with tracing.start_trace(
+        "resolve_repository",
+        metadata={"url": request.url, "requested_branch": request.branch},
+        tags=["acquire", "resolve"],
+    ):
+        with tracing.span("validate_url", input={"url": request.url}) as s:
+            try:
+                repo_ref = validate_github_url(request.url)
+            except InvalidRepositoryURL as e:
+                s.update(output={"valid": False, "reason": str(e)})
+                raise HTTPException(status_code=400, detail=str(e))
+            s.update(output={"valid": True, "owner": repo_ref.owner, "repo": repo_ref.repo})
 
-    # Resolving the default branch costs about a second and makes the 202 response meaningful:
-    # the client learns which branch it actually got rather than having to ask afterwards.
-    if request.branch:
-        try:
-            branch = validate_branch_name(request.branch)
-        except InvalidRepositoryURL as e:
-            raise HTTPException(status_code=400, detail=str(e))
-    else:
-        try:
-            remote = await asyncio.to_thread(list_remote_branches, repo_ref.clone_url)
-        except CloneFailed as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Could not reach '{repo_ref.name}' on GitHub: {e}",
-            )
-        branch = remote.get("default_branch")
-        if not branch:
-            raise HTTPException(
-                status_code=422,
-                detail=f"'{repo_ref.name}' has no branches to index.",
-            )
+        # Resolving the default branch costs about a second and makes the 202 response meaningful:
+        # the client learns which branch it actually got rather than having to ask afterwards.
+        if request.branch:
+            with tracing.span("validate_branch", input={"branch": request.branch}) as s:
+                try:
+                    branch = validate_branch_name(request.branch)
+                except InvalidRepositoryURL as e:
+                    s.update(output={"valid": False, "reason": str(e)})
+                    raise HTTPException(status_code=400, detail=str(e))
+                s.update(output={"valid": True, "branch": branch})
+        else:
+            with tracing.span("ls_remote", input={"clone_url": repo_ref.clone_url}) as s:
+                try:
+                    remote = await asyncio.to_thread(list_remote_branches, repo_ref.clone_url)
+                except CloneFailed as e:
+                    s.update(output={"reachable": False, "reason": str(e)})
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Could not reach '{repo_ref.name}' on GitHub: {e}",
+                    )
+                branch = remote.get("default_branch")
+                s.update(output={"reachable": True, "default_branch": branch,
+                                 "branches": len(remote.get("branches", []))})
+            if not branch:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"'{repo_ref.name}' has no branches to index.",
+                )
 
     repository_id = derive_repository_id(repo_ref.owner, repo_ref.repo, branch)
     name = f"{repo_ref.name}@{branch}"
@@ -260,14 +322,26 @@ def _clone_and_reindex(repository_id: str, clone_url: str, branch: str,
     re-parsed and re-embedded, which matters because embedding is ~89 % of indexing time.
     """
     destination = _clone_dir(repository_id)
-    try:
-        commit_sha = clone_repository(clone_url, branch, destination)
-        enforce_clone_limits(destination)
-        result = index_repository_folder(destination, repository_id, name, force_full)
-        result["commit_sha"] = commit_sha
-        return result
-    finally:
-        shutil.rmtree(destination, ignore_errors=True)
+    with _acquire_trace(repository_id, clone_url, branch, name, "github_sync") as trace:
+        try:
+            commit_sha = _clone_with_limits(clone_url, branch, destination, name)
+            result = index_repository_folder(destination, repository_id, name, force_full,
+                                             job_id=repository_id, trigger="github_sync")
+            result["commit_sha"] = commit_sha
+            # The reuse counts are what make a sync cheap; on the trace they sit next to the
+            # clone that produced them, which is where "why was this sync slow?" gets answered.
+            trace.update(output={"status": "ok", "commit_sha": commit_sha,
+                                 "files": result["file_count"],
+                                 "reused_files": result["reused_files"],
+                                 "parsed_files": result["parsed_files"]})
+            return result
+        except Exception as e:
+            trace.update(output={"status": "failed", "error": str(e)})
+            raise
+        finally:
+            with tracing.span("cleanup", input={"path": destination}) as s:
+                shutil.rmtree(destination, ignore_errors=True)
+                s.update(output={"removed": not os.path.isdir(destination)})
 
 
 @router.post("/{repository_id}/sync")

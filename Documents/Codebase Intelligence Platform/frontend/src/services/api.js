@@ -127,12 +127,35 @@ export async function streamMessageToConversation(conversationId, message, onEve
 
       if (event.type === 'error') throw new Error(event.detail || 'Streaming failed');
       if (event.type === 'done') final = event;
+      // `done` is sent before the turn is written, so the answer has no position in the thread
+      // yet. `saved` carries it, and folding it into the final result is what lets a reader rate
+      // an answer they just watched arrive instead of having to reload first.
+      if (event.type === 'saved' && final) final = { ...final, answer_seq: event.answer_seq };
       onEvent(event);
     }
   }
 
   if (!final) throw new Error('Stream ended before the answer completed');
   return final;
+}
+
+/**
+ * Records a reader's verdict on one answer.
+ *
+ * Addressed by `seq` — the answer's position in the thread — rather than by its index in the
+ * rendered array, which differs whenever a thread is read back with a message limit.
+ */
+export async function sendFeedback(conversationId, seq, rating, comment = '') {
+  const res = await fetch(
+    `${API_BASE}/conversations/${conversationId}/messages/${seq}/feedback`,
+    {
+      method: 'POST',
+      headers: withAuth({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ rating, comment: comment || null })
+    }
+  );
+  if (!res.ok) throw await errorFrom(res, 'Could not record feedback');
+  return res.json();
 }
 
 /**

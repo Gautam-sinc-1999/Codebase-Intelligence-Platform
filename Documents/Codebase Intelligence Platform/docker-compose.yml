@@ -63,6 +63,100 @@ services:
       retries: 10
       start_period: 40s
 
+  # ── Observability (optional) ────────────────────────────────────────────────
+  # Start with:  docker compose --profile observability up -d
+  #
+  # Left out of the default `up` deliberately. Langfuse needs Postgres, ClickHouse and MinIO
+  # alongside it — four containers to watch traces of a system that runs perfectly well without
+  # any of them. The application treats tracing exactly like every other store here: absent keys
+  # mean the feature is off, and nothing else changes.
+  langfuse-db:
+    image: postgres:16-alpine
+    container_name: ci-langfuse-db
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: ci-langfuse-clickhouse
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DB: default
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q localhost:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  langfuse-minio:
+    image: minio/minio:latest
+    container_name: ci-langfuse-minio
+    profiles: ["observability"]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    volumes:
+      - langfuse-minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  langfuse:
+    image: langfuse/langfuse:3
+    container_name: ci-langfuse
+    profiles: ["observability"]
+    restart: unless-stopped
+    depends_on:
+      langfuse-db: {condition: service_healthy}
+      langfuse-clickhouse: {condition: service_healthy}
+      langfuse-minio: {condition: service_started}
+    ports:
+      # 3001, because the frontend dev server already owns 3000.
+      - "127.0.0.1:3001:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      REDIS_CONNECTION_STRING: redis://redis:6379
+      # Development defaults. Generate real values before exposing this anywhere.
+      NEXTAUTH_URL: http://localhost:3001
+      NEXTAUTH_SECRET: dev-only-change-me
+      SALT: dev-only-change-me
+      ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      TELEMETRY_ENABLED: "false"
+
 volumes:
   mongo-data:
   neo4j-data:
+  langfuse-db-data:
+  langfuse-clickhouse-data:
+  langfuse-minio-data:

@@ -366,3 +366,28 @@ async def test_app_shutdown_drains_indexing_jobs():
     finally:
         settings.SAMPLE_REPO_DIR = original_sample_dir
         indexing_jobs._jobs.pop("shutdown_probe", None)
+
+
+async def test_a_keyword_named_like_the_runners_own_parameter_reaches_the_callee():
+    """
+    `submit` forwards **kwargs to `fn`, and indexing takes a `job_id` of its own. With the
+    runner's `job_id` accepting keywords, that forward collided — "multiple values for argument
+    'job_id'" — and the indexing trace could never be told which job it belonged to. The runner's
+    own parameters are positional-only so a callee may name its arguments whatever it likes.
+    """
+    runner = JobRunner(max_workers=1, name="t")
+    seen = {}
+    results = {}
+
+    def work(*, job_id, trigger):
+        seen["job_id"] = job_id
+        seen["trigger"] = trigger
+        return "ok"
+
+    job = runner.submit("runner_job", work, job_id="callee_job", trigger="sync",
+                        on_success=lambda jid, res: results.update({jid: res}))
+    await runner.drain()
+
+    assert seen == {"job_id": "callee_job", "trigger": "sync"}
+    assert results == {"runner_job": "ok"}
+    assert job.job_id == "runner_job"

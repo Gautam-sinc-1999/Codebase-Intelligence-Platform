@@ -86,6 +86,28 @@ class ChromaVectorStore:
             self._open_client()
         return self.client
 
+    # The embedding model is loaded once and kept. ChromaDB's DefaultEmbeddingFunction
+    # constructs a fresh ONNXMiniLM_L6_V2 on *every* call, which reloads the model each time —
+    # fine when it happens once per collection write, wasteful when embedding a handful of
+    # strings in a loop.
+    _embedder = None
+
+    @classmethod
+    def embed_texts(cls, texts: List[str]) -> List[List[float]]:
+        """
+        Embeds arbitrary text with the same model the vector store uses (all-MiniLM-L6-v2, 384-d).
+
+        Exposed because similarity between two pieces of *text* is useful outside retrieval —
+        the answer-relevancy metric compares a question against questions generated from an
+        answer, and doing that with the model already loaded costs nothing extra.
+        """
+        if not texts:
+            return []
+        if cls._embedder is None:
+            from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+            cls._embedder = ONNXMiniLM_L6_V2()
+        return [list(vector) for vector in cls._embedder(list(texts))]
+
     def get_or_create_collection(self, repository_id: str):
         if self.is_fallback:
             if repository_id not in self.collections:

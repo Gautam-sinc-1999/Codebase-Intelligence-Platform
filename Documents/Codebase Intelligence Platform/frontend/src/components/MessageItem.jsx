@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { fetchSnippet } from '../services/api';
+import { fetchSnippet, sendFeedback } from '../services/api';
+import { canRate, nextRating, shouldAskWhy } from '../lib/feedback';
 import { ExecutionFlow } from './ExecutionFlow';
 import { ImpactAnalysisCard } from './ImpactAnalysisCard';
 
@@ -224,7 +225,141 @@ function SourceCard({ source, repositoryId, citedSha }) {
   );
 }
 
-export function MessageItem({ message, repositoryId }) {
+/**
+ * A reader's verdict on one answer.
+ *
+ * Every other score this system records is computable from the answer and the index — whether the
+ * citations resolve, whether the callers named are real — and all of them can be perfect for an
+ * answer that did not help. This is the only signal that measures whether it did.
+ *
+ * The rating is applied optimistically and rolled back if the request fails, because the button
+ * looking pressed when nothing was recorded is worse than a moment's delay.
+ */
+function FeedbackButtons({ conversationId, seq, initialRating, initialComment }) {
+  const [rating, setRating] = useState(initialRating || '');
+  const [comment, setComment] = useState(initialComment || '');
+  const [draft, setDraft] = useState('');
+  const [composing, setComposing] = useState(false);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (nextRating, nextComment) => {
+    const previous = { rating, comment };
+    setRating(nextRating);
+    setComment(nextComment);
+    setError('');
+    setBusy(true);
+    try {
+      await sendFeedback(conversationId, seq, nextRating, nextComment);
+    } catch (err) {
+      // Put it back the way it was — a thumb that looks recorded but was not is a lie.
+      setRating(previous.rating);
+      setComment(previous.comment);
+      setError(err.message || 'Could not record that.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const choose = (clicked) => {
+    if (busy) return;
+    if (shouldAskWhy(rating, clicked)) {
+      setDraft('');
+      setComposing(true);
+    } else {
+      setComposing(false);
+    }
+    const next = nextRating(rating, clicked);
+    // A thumbs-up carries no complaint, so switching to it drops the one left on a previous down.
+    submit(next, next === 'down' ? comment : '');
+  };
+
+  const buttonStyle = (active, tone) => ({
+    background: active ? `rgba(${tone}, 0.16)` : 'transparent',
+    border: `1px solid ${active ? `rgba(${tone}, 0.55)` : 'var(--border-glass)'}`,
+    borderRadius: '6px',
+    padding: '2px 8px',
+    fontSize: '0.78rem',
+    cursor: busy ? 'progress' : 'pointer',
+    opacity: busy ? 0.6 : 1,
+    lineHeight: 1.6
+  });
+
+  return (
+    <div style={{ marginTop: '12px', paddingTop: '10px', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+        <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>Was this useful?</span>
+        <button
+          type="button"
+          onClick={() => choose('up')}
+          disabled={busy}
+          aria-pressed={rating === 'up'}
+          title="This answer helped"
+          style={buttonStyle(rating === 'up', '34, 197, 94')}
+        >
+          👍
+        </button>
+        <button
+          type="button"
+          onClick={() => choose('down')}
+          disabled={busy}
+          aria-pressed={rating === 'down'}
+          title="This answer did not help"
+          style={buttonStyle(rating === 'down', '244, 63, 94')}
+        >
+          👎
+        </button>
+        {rating && !error && (
+          <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Thanks — recorded.</span>
+        )}
+        {error && (
+          <span style={{ fontSize: '0.7rem', color: 'var(--accent-rose)' }}>{error}</span>
+        )}
+      </div>
+
+      {/* Offered only on a thumbs-down, where "what was wrong" is the part worth knowing. */}
+      {composing && rating === 'down' && (
+        <div style={{ display: 'flex', gap: '6px', marginTop: '8px' }}>
+          <input
+            type="text"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && draft.trim()) {
+                submit('down', draft.trim());
+                setComposing(false);
+              }
+            }}
+            maxLength={1000}
+            placeholder="What was wrong? (optional)"
+            style={{
+              flex: 1, background: 'rgba(255,255,255,0.05)',
+              border: '1px solid var(--border-glass)', borderRadius: '6px',
+              padding: '5px 9px', color: '#fff', fontSize: '0.75rem', outline: 'none'
+            }}
+          />
+          <button
+            type="button"
+            className="btn-secondary"
+            style={{ fontSize: '0.72rem', padding: '4px 10px' }}
+            onClick={() => { submit('down', draft.trim()); setComposing(false); }}
+            disabled={busy}
+          >
+            Send
+          </button>
+        </div>
+      )}
+
+      {comment && !composing && (
+        <div style={{ marginTop: '6px', fontSize: '0.7rem', color: 'var(--text-muted)', fontStyle: 'italic' }}>
+          “{comment}”
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function MessageItem({ message, repositoryId, conversationId }) {
   const isUser = message.role === 'user';
   const isError = Boolean(message.error);
 
@@ -317,6 +452,17 @@ export function MessageItem({ message, repositoryId }) {
 
         {message.execution_flow && <ExecutionFlow executionFlow={message.execution_flow} />}
         {message.impact_analysis && <ImpactAnalysisCard impactAnalysis={message.impact_analysis} />}
+
+        {/* The rule lives in lib/feedback.js, where it can be tested — see canRate for why each
+            of the four disqualifying cases is one. */}
+        {canRate(message, conversationId) && (
+          <FeedbackButtons
+            conversationId={conversationId}
+            seq={message.seq}
+            initialRating={message.feedback}
+            initialComment={message.feedback_comment}
+          />
+        )}
       </div>
     </div>
   );

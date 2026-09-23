@@ -6,6 +6,10 @@ logger = logging.getLogger("retrieval.reranker")
 
 
 class CodeReranker:
+    # Scores from the most recent rerank, keyed by chunk_id. Read by tracing; never written to
+    # the chunks themselves, which are shared cache objects.
+    last_scores: Dict[str, Dict[str, float]] = {}
+
     """
     Reorders fused retrieval candidates using signals specific to code.
 
@@ -107,7 +111,14 @@ class CodeReranker:
         fused_scores: Dict[str, float],
         top_k: int,
     ) -> List[Dict[str, Any]]:
-        """Returns the top_k candidates in final ranked order."""
+        """
+        Returns the top_k candidates in final ranked order.
+
+        The scores that produced that order are recorded on `last_scores` rather than attached to
+        the chunks. The chunks are the cached index objects, shared with every other query and with
+        the stored citations — writing a per-query score onto them would leak it into both.
+        """
+        cls.last_scores = {}
         if not candidates:
             return []
 
@@ -116,4 +127,12 @@ class CodeReranker:
             for chunk in candidates
         ]
         scored.sort(key=lambda pair: pair[0], reverse=True)
-        return [chunk for _, chunk in scored[:top_k]]
+        top = scored[:top_k]
+        cls.last_scores = {
+            chunk["chunk_id"]: {
+                "rerank": round(score, 4),
+                "fused": round(fused_scores.get(chunk["chunk_id"], 0.0), 4),
+            }
+            for score, chunk in top
+        }
+        return [chunk for _, chunk in top]

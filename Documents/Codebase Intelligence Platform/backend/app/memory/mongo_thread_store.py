@@ -130,14 +130,54 @@ class MongoThreadStore:
 
     async def read_messages(self, conversation_id: str,
                             limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Reads a thread's messages in order, optionally only the most recent `limit`."""
+        """
+        Reads a thread's messages in order, optionally only the most recent `limit`.
+
+        `seq` is kept on the way out. It is how a reader's feedback names the answer it is about,
+        and the alternative — the client assuming its array index matches — is an invariant that
+        holds today only because nothing deletes a single message from a thread.
+        """
         cursor = self._messages().find({"conversation_id": conversation_id})
         rows = [self._clean(row) for row in await cursor.to_list(length=100000)]
         rows.sort(key=lambda m: m.get("seq", 0))
         if limit:
             rows = rows[-limit:]
-        return [{k: v for k, v in row.items() if k not in ("conversation_id", "seq")}
-                for row in rows]
+        return [{k: v for k, v in row.items() if k != "conversation_id"} for row in rows]
+
+    async def read_message(self, conversation_id: str, seq: int) -> Optional[Dict[str, Any]]:
+        """
+        One message by its position in the thread, `seq` included.
+
+        `read_messages` strips `seq` because callers there render a transcript. Feedback needs the
+        opposite: a single turn addressed by position, so that a thumb the reader clicks can be
+        traced back to the exact answer it was about without shipping the whole thread.
+        """
+        row = await self._messages().find_one(
+            {"conversation_id": conversation_id, "seq": int(seq)}
+        )
+        if row is None:
+            return None
+        cleaned = self._clean(row)
+        cleaned.pop("conversation_id", None)
+        return cleaned
+
+    async def set_message_feedback(self, conversation_id: str, seq: int, rating: str,
+                                   comment: Optional[str] = None) -> bool:
+        """
+        Stores a reader's rating on one message.
+
+        Kept on the turn rather than only sent to Langfuse, for two reasons: the thumb has to
+        still look pressed when the thread is reopened, and feedback given while tracing was off
+        would otherwise be thrown away. Last write wins, so changing your mind works.
+        """
+        update: Dict[str, Any] = {"feedback": rating}
+        # An empty comment clears a previous one rather than leaving a stale note attached to a
+        # rating that has since been changed.
+        update["feedback_comment"] = comment or ""
+        result = await self._messages().update_one(
+            {"conversation_id": conversation_id, "seq": int(seq)}, {"$set": update}
+        )
+        return bool(getattr(result, "matched_count", 0))
 
     async def load(self, conversation_id: str,
                    message_limit: Optional[int] = None) -> Optional[Dict[str, Any]]:

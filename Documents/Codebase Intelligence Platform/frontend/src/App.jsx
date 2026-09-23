@@ -207,6 +207,9 @@ export function App() {
         impact_analysis: response.impact_analysis,
         degraded: response.degraded,
         degraded_reason: response.degraded_reason,
+        // Where the answer landed in the thread, so it can be rated without a reload. Absent
+        // only if the turn failed to save, in which case there is nothing to rate.
+        seq: response.answer_seq,
         streaming: false
       });
 

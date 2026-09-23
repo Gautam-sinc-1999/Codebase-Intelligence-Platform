@@ -43,6 +43,22 @@ class Settings:
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     GROQ_BASE_URL: str = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    # Evaluation judge — a **separate** provider and key from the one that answers questions.
+    # RAGAS metrics are LLM-as-judge and cost 15-30 calls per item, so sharing the product's
+    # provider would make an evaluation run compete with live answers for the same rate limit.
+    # Defaults to Gemini through its OpenAI-compatible endpoint, which needs no extra client
+    # code and no paid plan; any OpenAI-compatible endpoint works by changing these four.
+    JUDGE_PROVIDER: str = os.getenv("JUDGE_PROVIDER", "gemini")
+    JUDGE_API_KEY: str = os.getenv("JUDGE_API_KEY", "")
+    JUDGE_BASE_URL: str = os.getenv(
+        "JUDGE_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
+    )
+    JUDGE_MODEL: str = os.getenv("JUDGE_MODEL", "gemini-2.0-flash")
+    # Free tiers limit requests per minute far more tightly than per day, so the harness paces
+    # itself rather than firing a dataset's worth of judgements at once.
+    JUDGE_MAX_CONCURRENCY: int = int(os.getenv("JUDGE_MAX_CONCURRENCY", "2"))
+    JUDGE_TIMEOUT_SECONDS: float = float(os.getenv("JUDGE_TIMEOUT_SECONDS", "60"))
     
     # Authentication (opt-in). When API_KEY is set, every /api route requires it via the
     # X-API-Key header or an Authorization: Bearer token. Left unset, auth is disabled and a
@@ -86,6 +102,13 @@ class Settings:
     # rate-limits everything for the next minute, which is how one query in four ended up
     # falling back to a template.
     MAX_PROMPT_TOKENS: int = int(os.getenv("MAX_PROMPT_TOKENS", 5000))
+
+    # ── Observability ────────────────────────────────────────────
+    # Tracing is off unless both keys are set. It is developer-facing and entirely optional: the
+    # product answers identically without it, the same way it runs without Redis or Neo4j.
+    LANGFUSE_PUBLIC_KEY: str = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+    LANGFUSE_SECRET_KEY: str = os.getenv("LANGFUSE_SECRET_KEY", "")
+    LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "http://localhost:3001")
 
     # How long shutdown waits for background indexing to finish before closing the stores.
     SHUTDOWN_GRACE_SECONDS: float = float(os.getenv("SHUTDOWN_GRACE_SECONDS", 60))

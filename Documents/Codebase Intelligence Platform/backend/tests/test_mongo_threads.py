@@ -72,15 +72,39 @@ async def test_reading_the_last_n_messages(api_client):
 
 
 async def test_internal_fields_do_not_leak_into_the_api_shape(api_client):
-    """`_id`, `conversation_id` and `seq` are storage concerns, not part of a message."""
+    """
+    `_id` and `conversation_id` are storage concerns, not part of a message.
+
+    `seq` used to be on that list. It came off it when feedback arrived: a reader's rating has to
+    name the answer it is about, and the client cannot use its array index to do so — a limited
+    read (`GET /conversations/{id}?message_limit=N`) returns a *tail slice*, so on a long thread
+    index 0 is not message 0. Addressing by index would have attached ratings to the wrong turn.
+    """
     await thread_store.create("conv_clean", "repo_1")
     await thread_store.append_messages("conv_clean", [{"role": "user", "content": "hi"}])
 
     message = (await thread_store.read_messages("conv_clean"))[0]
-    assert set(message) == {"role", "content"}
+    assert set(message) == {"role", "content", "seq"}
+    assert message["seq"] == 0
 
     meta = await thread_store.read_meta("conv_clean")
     assert "_id" not in meta
+
+
+async def test_a_limited_read_keeps_each_message_addressable(api_client):
+    """
+    The reason `seq` is exposed: on a tail slice, position in the array is not position in the
+    thread. Feedback posted against an index would land on a different answer entirely.
+    """
+    await thread_store.create("conv_tail", "repo_1")
+    await thread_store.append_messages("conv_tail", [
+        {"role": "user", "content": f"m{n}"} for n in range(6)
+    ])
+
+    tail = await thread_store.read_messages("conv_tail", limit=2)
+    assert [m["content"] for m in tail] == ["m4", "m5"]
+    # Index 0 of the slice is message 4 of the thread — the whole point.
+    assert [m["seq"] for m in tail] == [4, 5]
 
 
 async def test_load_returns_metadata_and_messages_together(api_client):

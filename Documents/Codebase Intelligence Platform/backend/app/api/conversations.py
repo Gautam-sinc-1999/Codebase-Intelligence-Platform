@@ -1,5 +1,6 @@
 import uuid
 import json
+import logging
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -7,8 +8,12 @@ from typing import List, Dict, Any, Optional
 
 from app.core.database import db_client, sanitize_mongo_doc
 from app.memory.conversation_memory import ConversationMemory
+from app.observability import start_trace, span, set_trace_io, score
+from app.observability import scorers
 from app.agents.orchestrator import CodebaseAgentOrchestrator
 from app.api.repositories import get_repository_chunks, indexing_status
+
+logger = logging.getLogger("api.conversations")
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -31,6 +36,10 @@ class MessageResponse(BaseModel):
     # rate-limited, unreachable, or not configured. Defaulted so an older client is unaffected.
     degraded: bool = False
     degraded_reason: Optional[str] = None
+    # Where this answer landed in the thread. The client needs it to rate the answer without
+    # inferring a position from its own array, which is wrong for any thread read back with a
+    # message limit. Optional so an older client is unaffected.
+    answer_seq: Optional[int] = None
 
 @router.post("")
 async def create_conversation(req: CreateConversationRequest):
@@ -105,28 +114,75 @@ async def _load_conversation_context(conversation_id: str):
     return conv, repo_id, all_chunks
 
 
+def _record_scores(result: Dict[str, Any], all_chunks: List[Dict[str, Any]]) -> None:
+    """
+    Computes and attaches the deterministic scores for a finished turn.
+
+    Wrapped whole: a scorer that raises must never fail the query it was scoring. That is the same
+    rule every store in this system follows — a failure degrades the feature it serves, nothing
+    else.
+    """
+    try:
+        values = scorers.collect(
+            answer=result.get("answer", ""),
+            sources=result.get("sources", []),
+            all_chunks=all_chunks,
+            intent=result.get("intent", ""),
+            target_symbol=result.get("working_context", {}).get("current_symbol", ""),
+            graph_callers=result.get("graph_callers", []),
+            prompt_chars=result.get("prompt_chars", 0),
+            budget_chars=result.get("budget_chars", 0),
+            degraded=result.get("degraded", False),
+            facts_truncated=result.get("graph_facts_truncated", False),
+        )
+        for name, value in values.items():
+            score(name, value, data_type="BOOLEAN" if isinstance(value, bool) else "NUMERIC")
+    except Exception as e:
+        logger.warning("Could not record scores: %s", e)
+
+
 @router.post("/{conversation_id}/messages", response_model=MessageResponse)
 async def send_message(conversation_id: str, req: MessageRequest):
-    conv, repo_id, all_chunks = await _load_conversation_context(conversation_id)
+    # The trace opens here rather than inside the orchestrator, because the work on either side of
+    # it is not free: loading the context can rebuild a repository's whole graph on a cache miss,
+    # and saving the turn writes through to MongoDB.
+    async with start_trace(
+        "query", session_id=conversation_id, tags=["buffered"],
+    ):
+        set_trace_io(input=req.message)
 
-    # Process query with agent. Prior turns are passed so follow-up questions ("show me the
-    # line numbers", "what about its callers") can resolve against what was already discussed.
-    result = await CodebaseAgentOrchestrator.process_user_query(
-        repository_id=repo_id,
-        conversation_id=conversation_id,
-        query=req.message,
-        all_chunks=all_chunks,
-        existing_summary=conv.get("summary", ""),
-        working_context=conv.get("working_context", {}),
-        history=conv.get("messages", [])
-    )
+        with span("load_context", input={"conversation_id": conversation_id}) as _sp:
+            conv, repo_id, all_chunks = await _load_conversation_context(conversation_id)
+            _sp.update(output={
+                "repository_id": repo_id,
+                "chunk_count": len(all_chunks),
+                "history_messages": len(conv.get("messages", [])),
+                "has_summary": bool(conv.get("summary")),
+            })
 
-    # Save turn directly to MongoDB conversation session document
-    await ConversationMemory.save_turn(
-        conversation_id=conversation_id,
-        user_message=req.message,
-        assistant_response=result
-    )
+        # Process query with agent. Prior turns are passed so follow-up questions ("show me the
+        # line numbers", "what about its callers") can resolve against what was already discussed.
+        result = await CodebaseAgentOrchestrator.process_user_query(
+            repository_id=repo_id,
+            conversation_id=conversation_id,
+            query=req.message,
+            all_chunks=all_chunks,
+            existing_summary=conv.get("summary", ""),
+            working_context=conv.get("working_context", {}),
+            history=conv.get("messages", [])
+        )
+
+        with span("save_turn") as _sp:
+            # Save turn directly to MongoDB conversation session document
+            answer_seq = await ConversationMemory.save_turn(
+                conversation_id=conversation_id,
+                user_message=req.message,
+                assistant_response=result
+            )
+            _sp.update(output={"messages_written": 2, "answer_seq": answer_seq})
+
+        set_trace_io(output=result["answer"])
+        _record_scores(result, all_chunks)
 
     return MessageResponse(
         conversation_id=conversation_id,
@@ -138,6 +194,7 @@ async def send_message(conversation_id: str, req: MessageRequest):
         impact_analysis=result["impact_analysis"],
         degraded=result.get("degraded", False),
         degraded_reason=result.get("degraded_reason"),
+        answer_seq=answer_seq,
     )
 
 @router.post("/{conversation_id}/messages/stream")
@@ -155,15 +212,22 @@ async def stream_message(conversation_id: str, req: MessageRequest):
 
     async def event_stream():
         final_result = None
-        try:
+        # The trace lives inside the generator, not around it. A StreamingResponse returns
+        # immediately and the body is produced later, so a trace opened outside would close before
+        # a single token had been generated and record a turn that took no time at all.
+        async with start_trace(
+            "query", session_id=conversation_id, tags=["streamed"],
+        ):
+          set_trace_io(input=req.message)
+          try:
             async for event in CodebaseAgentOrchestrator.stream_user_query(
-                repository_id=repo_id,
-                conversation_id=conversation_id,
-                query=req.message,
-                all_chunks=all_chunks,
-                existing_summary=conv.get("summary", ""),
-                working_context=conv.get("working_context", {}),
-                history=conv.get("messages", []),
+                    repository_id=repo_id,
+                    conversation_id=conversation_id,
+                    query=req.message,
+                    all_chunks=all_chunks,
+                    existing_summary=conv.get("summary", ""),
+                    working_context=conv.get("working_context", {}),
+                    history=conv.get("messages", []),
             ):
                 if event["type"] == "done":
                     final_result = event["result"]
@@ -180,20 +244,30 @@ async def stream_message(conversation_id: str, req: MessageRequest):
                     yield f"data: {json.dumps(payload)}\n\n"
                 else:
                     yield f"data: {json.dumps(event)}\n\n"
-        except Exception as e:
+          except Exception as e:
             # The response has already begun, so an error cannot become an HTTP status; it is
             # delivered as an event the client can render instead of a silently truncated answer.
             yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
             return
 
-        if final_result:
-            # Persisted only after the stream completes, so an interrupted turn is not recorded
-            # as a half-finished assistant message.
-            await ConversationMemory.save_turn(
-                conversation_id=conversation_id,
-                user_message=req.message,
-                assistant_response=final_result,
-            )
+          if final_result:
+            with span("save_turn") as _sp:
+                # Persisted only after the stream completes, so an interrupted turn is not recorded
+                # as a half-finished assistant message.
+                answer_seq = await ConversationMemory.save_turn(
+                    conversation_id=conversation_id,
+                    user_message=req.message,
+                    assistant_response=final_result,
+                )
+                _sp.update(output={"messages_written": 2, "answer_seq": answer_seq})
+
+            # A separate event, because `done` is emitted before the turn is written and the
+            # answer has no position in the thread until it is. Without this the reader would
+            # have to reload before being able to rate the answer they just watched arrive.
+            yield f"data: {json.dumps({'type': 'saved', 'answer_seq': answer_seq})}\n\n"
+
+            set_trace_io(output=final_result["answer"])
+            _record_scores(final_result, all_chunks)
 
     return StreamingResponse(
         event_stream(),
@@ -234,6 +308,78 @@ async def acknowledge_drift(conversation_id: str, req: DriftAckRequest):
 
     await thread_store.update_meta(conversation_id, drift_ack_sha=sha)
     return {"conversation_id": conversation_id, "drift_ack_sha": sha, "status": "acknowledged"}
+
+
+class FeedbackRequest(BaseModel):
+    # "up" or "down" rather than a number, because that is what the reader is actually expressing.
+    # It is converted to 1/0 at the boundary, so the dashboard averages to a satisfaction rate.
+    rating: str
+    comment: Optional[str] = None
+
+
+# Long enough to say what was wrong, short enough not to become a bug report channel.
+MAX_FEEDBACK_COMMENT = 1000
+
+
+@router.post("/{conversation_id}/messages/{seq}/feedback")
+async def record_feedback(conversation_id: str, seq: int, req: FeedbackRequest):
+    """
+    Records a reader's verdict on one answer, as a score on that answer's trace.
+
+    This is the only signal in the system that measures whether an answer was *useful*. Every
+    other score is computable from the answer and the index — whether its citations resolve,
+    whether its callers were real — and all of them can be perfect for an answer that did not
+    help. That gap is what this closes.
+
+    Addressed by position in the thread rather than by trace id, so the client cannot post scores
+    against arbitrary traces: the server resolves the id from the stored turn.
+
+    Feedback is stored on the turn either way. Langfuse is where it is *analysed*, not where it
+    lives — tracing being off must not silently discard what someone took the trouble to say.
+    """
+    from app.memory.mongo_thread_store import thread_store
+    from app.observability import score_trace
+
+    rating = (req.rating or "").strip().lower()
+    if rating not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="Rating must be 'up' or 'down'.")
+
+    comment = (req.comment or "").strip()
+    if len(comment) > MAX_FEEDBACK_COMMENT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A comment cannot be longer than {MAX_FEEDBACK_COMMENT} characters.",
+        )
+
+    if not await thread_store.exists(conversation_id):
+        raise HTTPException(status_code=404, detail="Conversation session not found")
+
+    message = await thread_store.read_message(conversation_id, seq)
+    if message is None:
+        raise HTTPException(status_code=404, detail=f"This thread has no message {seq}.")
+    if message.get("role") != "assistant":
+        raise HTTPException(
+            status_code=400,
+            detail="Only an assistant answer can be rated.",
+        )
+
+    value = 1.0 if rating == "up" else 0.0
+    await thread_store.set_message_feedback(conversation_id, seq, rating, comment or None)
+
+    # A trace id is absent whenever the answer was produced with tracing off, which is a normal
+    # state, not a failure. The feedback is kept regardless; it simply has no trace to hang on.
+    recorded = score_trace(
+        message.get("trace_id", ""), "user_feedback", value,
+        comment=comment or None, data_type="NUMERIC",
+    )
+
+    return {
+        "conversation_id": conversation_id,
+        "seq": seq,
+        "rating": rating,
+        "stored": True,
+        "traced": recorded,
+    }
 
 
 class RenameRequest(BaseModel):

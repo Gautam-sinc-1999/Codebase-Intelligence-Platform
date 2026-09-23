@@ -1,6 +1,7 @@
 import os
 import re
 import stat
+import time
 import asyncio
 import logging
 import zipfile
@@ -19,6 +20,7 @@ from app.vector.chromadb_client import chroma_store
 from app.graph.neo4j_client import neo4j_client
 from app.ingestion.index_store import index_store
 from app.retrieval.hybrid_retriever import BM25IndexCache
+from app.observability import tracing
 
 logger = logging.getLogger("api.repositories")
 
@@ -307,17 +309,60 @@ class RepositoryResponse(BaseModel):
     commit_sha: Optional[str] = None
     synced_at: Optional[str] = None
 
-def index_repository_folder(repo_dir: str, repo_id: str, repo_name: str, force_full: bool = False) -> Dict[str, Any]:
+def index_repository_folder(repo_dir: str, repo_id: str, repo_name: str, force_full: bool = False,
+                            *, job_id: Optional[str] = None, trigger: str = "upload") -> Dict[str, Any]:
     """
     Discovers, parses, embeds and graphs a repository folder, then persists the index.
 
     Synchronous and CPU-bound: callers on the event loop must dispatch it via asyncio.to_thread.
+
+    Traced as its own root, not as a child of whatever was running when it was submitted. Indexing
+    is handed to a worker thread by `JobRunner` through `run_in_executor`, which — unlike
+    `asyncio.to_thread` — does not copy the caller's context, so an ambient trace would not reach
+    here. `job_id` and `trigger` are carried as metadata instead, which is what ties a trace back
+    to the job a caller is polling.
+
+    Nobody watches this live, and that is exactly why it is worth tracing: it is where ~89% of the
+    compute goes, it is where incremental re-index either works or silently does not, and a failure
+    here only surfaces much later as a 409.
     """
     indexing_status[repo_id] = "indexing"
-    try:
-        # Streamed, so only the file being parsed is held in memory (F-24).
-        discovered_files = FileDiscovery.iter_repository(repo_dir, repo_id)
+    with tracing.start_trace_sync(
+        "index",
+        metadata={"repository_id": repo_id, "repository": repo_name, "job_id": job_id,
+                  "trigger": trigger, "force_full": force_full},
+        tags=["index", trigger],
+    ) as trace:
+        try:
+            result = _run_indexing_pipeline(repo_dir, repo_id, repo_name, force_full, trace)
+        except Exception as e:
+            indexing_status[repo_id] = f"failed: {e}"
+            logger.error("Indexing failed for '%s': %s", repo_id, e)
+            trace.update(output={"status": "failed", "error": str(e)})
+            raise
 
+        indexing_status[repo_id] = "ready"
+        trace.update(output={
+            "status": "ready",
+            "files": result["file_count"],
+            "chunks": len(result["all_chunks"]),
+            "reused_files": result["reused_files"],
+            "parsed_files": result["parsed_files"],
+        })
+        return result
+
+
+def _run_indexing_pipeline(repo_dir: str, repo_id: str, repo_name: str, force_full: bool,
+                           trace) -> Dict[str, Any]:
+    """
+    The six stages, each its own span.
+
+    Discovery, parsing and chunking share one span because they share one streaming loop: files are
+    parsed as they are discovered so that only the current file is held in memory (F-24). Splitting
+    them into three spans would mean three passes and would undo that. Their costs are separated by
+    accumulating the time each takes and reporting it on the one span instead.
+    """
+    with tracing.span("load_previous_index", input={"force_full": force_full}) as s:
         # Incremental re-index. FileDiscovery has always computed a SHA-256 per file; nothing
         # read it, so every re-index re-parsed and re-embedded the entire repository even when
         # a single file had changed. Chunks for files whose hash is unchanged are reused from
@@ -328,15 +373,24 @@ def index_repository_folder(repo_dir: str, repo_id: str, repo_name: str, force_f
         chunks_by_file: Dict[str, List[Dict[str, Any]]] = {}
         for chunk in previous_chunks:
             chunks_by_file.setdefault(chunk.get("file_path", ""), []).append(chunk)
+        s.update(output={"known_files": len(previous_manifest),
+                         "previous_chunks": len(previous_chunks),
+                         "incremental": bool(previous_chunks)})
 
-        all_chunks: List[Dict[str, Any]] = []
-        changed_chunks: List[Dict[str, Any]] = []
-        manifest: Dict[str, str] = {}
-        languages = set()
-        reused_files = 0
-        parsed_files = 0
-        file_count = 0
-        total_lines = 0
+    all_chunks: List[Dict[str, Any]] = []
+    changed_chunks: List[Dict[str, Any]] = []
+    manifest: Dict[str, str] = {}
+    languages = set()
+    reused_files = 0
+    parsed_files = 0
+    file_count = 0
+    total_lines = 0
+    parse_seconds = 0.0
+    chunk_seconds = 0.0
+
+    with tracing.span("discover_parse_chunk", input={"path": repo_dir}) as s:
+        # Streamed, so only the file being parsed is held in memory (F-24).
+        discovered_files = FileDiscovery.iter_repository(repo_dir, repo_id)
 
         for f_meta in discovered_files:
             file_count += 1
@@ -354,12 +408,32 @@ def index_repository_folder(repo_dir: str, repo_id: str, repo_name: str, force_f
                 reused_files += 1
                 continue
 
+            started = time.perf_counter()
             entities = MultiLanguageASTParser.parse_file(f_meta)
+            parsed = time.perf_counter()
             chunks = HierarchicalCodeChunker.create_chunks(f_meta, entities)
+            chunk_seconds += time.perf_counter() - parsed
+            parse_seconds += parsed - started
+
             all_chunks.extend(chunks)
             changed_chunks.extend(chunks)
             parsed_files += 1
 
+        # The reuse counts are the whole point of the incremental path, and they are the thing a
+        # log line makes you go looking for and a trace just shows you.
+        s.update(output={
+            "files": file_count,
+            "total_lines": total_lines,
+            "languages": sorted(languages),
+            "parsed_files": parsed_files,
+            "reused_files": reused_files,
+            "chunks": len(all_chunks),
+            "changed_chunks": len(changed_chunks),
+            "parse_seconds": round(parse_seconds, 3),
+            "chunk_seconds": round(chunk_seconds, 3),
+        })
+
+    with tracing.span("prune_stale") as s:
         # Files that disappeared are simply absent from `discovered_files`, so their chunks fall
         # out of the index — but they must also be removed from the vector store, or deleted code
         # keeps being retrieved.
@@ -367,13 +441,16 @@ def index_repository_folder(repo_dir: str, repo_id: str, repo_name: str, force_f
         stale_ids = [c["chunk_id"] for c in previous_chunks if c["chunk_id"] not in surviving_ids]
         if stale_ids:
             chroma_store.delete_chunks(repo_id, stale_ids)
+        s.update(output={"stale_chunks_removed": len(stale_ids)})
 
+    with tracing.span("embed") as s:
         # Only changed chunks need re-embedding — but only if the vector store actually still
         # holds the rest. The index on disk and the collection can diverge (the collection is
         # cleared, points elsewhere, or a write failed), and re-embedding just the changed files
         # would then leave semantic search querying a near-empty collection while the chunk index
         # looks complete. Verify the count and re-embed everything when it does not line up.
         embed_all = not previous_chunks
+        resynced = False
         if not embed_all:
             try:
                 present = chroma_store.get_or_create_collection(repo_id).count()
@@ -383,28 +460,35 @@ def index_repository_folder(repo_dir: str, repo_id: str, repo_name: str, force_f
                         repo_id, present, len(all_chunks),
                     )
                     embed_all = True
+                    resynced = True
             except Exception as e:
                 logger.warning("Could not verify vector store for '%s' (%s); re-embedding in full.", repo_id, e)
                 embed_all = True
+                resynced = True
 
-        chroma_store.add_chunks(repo_id, all_chunks if embed_all else changed_chunks)
+        embedded = all_chunks if embed_all else changed_chunks
+        chroma_store.add_chunks(repo_id, embedded)
+        # `resynced` marks the fall-back to a full re-embed after the collection was found short.
+        # It should be rare; if a dashboard shows it is not, the vector store is losing writes.
+        s.update(output={"embedded_chunks": len(embedded), "embed_all": embed_all,
+                         "resynced_after_drift": resynced})
 
+    with tracing.span("graph") as s:
         neo4j_client.build_repository_graph(repo_id, all_chunks)
+        s.update(output={"chunks": len(all_chunks)})
+
+    with tracing.span("persist") as s:
         repository_chunks_cache[repo_id] = all_chunks
         index_store.save(repo_id, all_chunks)
         index_store.save_manifest(repo_id, manifest)
         BM25IndexCache.invalidate(repo_id)
-        indexing_status[repo_id] = "ready"
+        s.update(output={"chunks": len(all_chunks), "manifest_files": len(manifest)})
 
-        if previous_chunks:
-            logger.info(
-                "Indexed '%s': %d file(s) reused, %d re-parsed, %d stale chunk(s) removed.",
-                repo_id, reused_files, parsed_files, len(stale_ids),
-            )
-    except Exception as e:
-        indexing_status[repo_id] = f"failed: {e}"
-        logger.error("Indexing failed for '%s': %s", repo_id, e)
-        raise
+    if previous_chunks:
+        logger.info(
+            "Indexed '%s': %d file(s) reused, %d re-parsed, %d stale chunk(s) removed.",
+            repo_id, reused_files, parsed_files, len(stale_ids),
+        )
 
     return {
         "repository_id": repo_id,
@@ -506,6 +590,7 @@ async def upload_repository(file: UploadFile = File(...)):
     indexing_jobs.submit(
         repo_id,
         index_repository_folder, extract_dir, repo_id, repo_name,
+        job_id=repo_id, trigger="upload",
         on_success=on_success,
         on_failure=on_failure,
     )
@@ -561,51 +646,94 @@ async def get_snippet(repository_id: str, file_path: str, start_line: int = 1,
     would be exact and unaffordable: indexing every commit of a 500-commit repository is roughly
     428,500 chunks and ~16 GB, against ~5,300 shared chunks if the same code is stored once.
     """
-    chunks = get_repository_chunks(repository_id)
-    if not chunks:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Repository '{repository_id}' is not indexed, so its source cannot be read.",
-        )
+    # Its own root trace: this is a request of its own, fired long after the answer that cited it,
+    # so there is no query trace to hang it from. `match` is the reason it is worth tracing at all
+    # — a citation that resolves as "nearest" is one the reader was shown slightly wrong code for,
+    # and nothing else in the system would ever report that.
+    async with tracing.start_trace(
+        "snippet",
+        metadata={"repository_id": repository_id, "file_path": file_path,
+                  "start_line": start_line, "end_line": end_line, "cited_sha": at_sha or None},
+        tags=["snippet"],
+    ) as trace:
+        with tracing.span("load_chunks", input={"repository_id": repository_id}) as s:
+            chunks = get_repository_chunks(repository_id)
+            s.update(output={"chunks": len(chunks), "indexed": bool(chunks)})
 
-    candidates = [c for c in chunks if c.get("file_path") == file_path]
-    if not candidates:
-        raise HTTPException(status_code=404, detail=f"'{file_path}' is not part of this repository.")
+        if not chunks:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Repository '{repository_id}' is not indexed, so its source cannot be read.",
+            )
 
-    # Prefer the chunk that starts exactly where the citation says; otherwise the smallest chunk
-    # that encloses the range, which is the tightest definition containing those lines.
-    exact = next((c for c in candidates if c["start_line"] == start_line), None)
-    if exact is None and end_line:
-        enclosing = [c for c in candidates if c["start_line"] <= start_line and c["end_line"] >= end_line]
-        exact = min(enclosing, key=lambda c: c["end_line"] - c["start_line"]) if enclosing else None
-    chunk = exact or min(candidates, key=lambda c: abs(c["start_line"] - start_line))
+        with tracing.span("resolve_pointer",
+                          input={"file_path": file_path, "start_line": start_line,
+                                 "end_line": end_line}) as s:
+            candidates = [c for c in chunks if c.get("file_path") == file_path]
+            if not candidates:
+                s.update(output={"candidates": 0, "match": "no_such_file"})
+                raise HTTPException(
+                    status_code=404, detail=f"'{file_path}' is not part of this repository."
+                )
 
-    payload = {
-        "repository_id": repository_id,
-        "file_path": chunk["file_path"],
-        "symbol": chunk.get("symbol", ""),
-        "language": chunk.get("language", ""),
-        "start_line": chunk["start_line"],
-        "end_line": chunk["end_line"],
-        "code": chunk.get("code_snippet", ""),
-        "stale": False,
-    }
+            # Prefer the chunk that starts exactly where the citation says; otherwise the smallest
+            # chunk that encloses the range, which is the tightest definition containing those
+            # lines.
+            resolved = next((c for c in candidates if c["start_line"] == start_line), None)
+            match = "exact" if resolved is not None else ""
+            if resolved is None and end_line:
+                enclosing = [c for c in candidates
+                             if c["start_line"] <= start_line and c["end_line"] >= end_line]
+                if enclosing:
+                    resolved = min(enclosing, key=lambda c: c["end_line"] - c["start_line"])
+                    match = "enclosing"
+            if resolved is None:
+                resolved = min(candidates, key=lambda c: abs(c["start_line"] - start_line))
+                match = "nearest"
+            chunk = resolved
 
-    if at_sha:
-        repo = await db_client.get_collection("repositories").find_one(
-            {"repository_id": repository_id}
-        )
-        current_sha = (repo or {}).get("commit_sha") or ""
-        if current_sha and current_sha != at_sha:
-            payload["stale"] = True
-            payload["indexed_sha"] = current_sha
-            payload["cited_sha"] = at_sha
-            # Whether the citation still lands where it did is knowable cheaply: if the pointer
-            # resolved to a chunk starting on the cited line, the symbol has not moved, so the
-            # reader can be told the difference between "shifted" and "probably fine".
-            payload["moved"] = chunk["start_line"] != start_line
+            s.update(output={"candidates": len(candidates), "match": match,
+                             "symbol": chunk.get("symbol", ""),
+                             "resolved_start": chunk["start_line"],
+                             "resolved_end": chunk["end_line"],
+                             "line_offset": chunk["start_line"] - start_line})
 
-    return payload
+        payload = {
+            "repository_id": repository_id,
+            "file_path": chunk["file_path"],
+            "symbol": chunk.get("symbol", ""),
+            "language": chunk.get("language", ""),
+            "start_line": chunk["start_line"],
+            "end_line": chunk["end_line"],
+            "code": chunk.get("code_snippet", ""),
+            "stale": False,
+        }
+
+        if at_sha:
+            with tracing.span("staleness_check", input={"cited_sha": at_sha}) as s:
+                repo = await db_client.get_collection("repositories").find_one(
+                    {"repository_id": repository_id}
+                )
+                current_sha = (repo or {}).get("commit_sha") or ""
+                if current_sha and current_sha != at_sha:
+                    payload["stale"] = True
+                    payload["indexed_sha"] = current_sha
+                    payload["cited_sha"] = at_sha
+                    # Whether the citation still lands where it did is knowable cheaply: if the
+                    # pointer resolved to a chunk starting on the cited line, the symbol has not
+                    # moved, so the reader can be told the difference between "shifted" and
+                    # "probably fine".
+                    payload["moved"] = chunk["start_line"] != start_line
+                s.update(output={"indexed_sha": current_sha, "stale": payload["stale"],
+                                 "moved": payload.get("moved"),
+                                 # No recorded sha means the repository came from a zip, where
+                                 # staleness is not knowable — distinct from "checked and fresh".
+                                 "comparable": bool(current_sha)})
+
+        trace.update(output={"match": match, "stale": payload["stale"],
+                             "symbol": payload["symbol"],
+                             "lines": f"{payload['start_line']}-{payload['end_line']}"})
+        return payload
 
 
 @router.get("/{repository_id}/status")
@@ -703,7 +831,7 @@ async def reindex_repository(repository_id: str, full: bool = False):
     try:
         result = await asyncio.to_thread(
             index_repository_folder, source_path, repository_id,
-            repo.get("name", repository_id), full,
+            repo.get("name", repository_id), full, job_id=repository_id, trigger="reindex",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Re-index failed: {e}")

@@ -177,8 +177,9 @@ hr{border:none;border-top:1px solid var(--rule);margin:40px 0}
   <a href="#storage"><span class="n">08</span>Storage</a>
   <a href="#github"><span class="n">09</span>GitHub &amp; drift</a>
   <a href="#async"><span class="n">10</span>Async &amp; failure</a>
-  <a href="#numbers"><span class="n">11</span>Numbers</a>
-  <a href="#defend"><span class="n">12</span>Defending it</a>
+  <a href="#observability"><span class="n">11</span>Observability</a>
+  <a href="#numbers"><span class="n">12</span>Numbers</a>
+  <a href="#defend"><span class="n">13</span>Defending it</a>
 </nav>
 
 <main>
@@ -898,8 +899,134 @@ index is still answerable, so a network hiccup should not destroy it.</p></div>
 </section>
 
 <!-- ============================================ 11 -->
+<section id="observability">
+<h2><span class="num">11</span>Observability</h2>
+
+<p>Tracing is <strong>optional and off by default</strong>. With no keys set the product behaves
+identically — and that is the design constraint, not a convenience: a dashboard serves the
+developer, so an unreachable one must never cost a user their answer. Every call into the tracer is
+guarded, exactly as every call into MongoDB, Redis, Neo4j and ChromaDB is.</p>
+
+<h3>The bug that guarding introduced</h3>
+<p>The first version wrapped the whole context manager in <code>try/except</code>, including the
+<code>yield</code>. That is wrong, and quietly so:</p>
+<pre><span class="c"># wrong — the body is inside the guard</span>
+<span class="k">try</span>:
+    <span class="k">with</span> client.start_as_current_observation(name=name) <span class="k">as</span> s:
+        <span class="k">yield</span> s          <span class="c"># an error here is thrown back in…</span>
+<span class="k">except</span> Exception <span class="k">as</span> e:
+    logger.debug(...)      <span class="c"># …caught here…</span>
+    <span class="k">yield</span> _NULL        <span class="c"># …and the second yield corrupts the unwind</span></pre>
+<p>When the traced code raised, <code>contextlib</code> threw that exception back into the generator
+at the <code>yield</code>. The guard caught it, yielded a second time, and Python replaced the real
+error with <code>RuntimeError: generator didn't stop after throw()</code>. Since indexing records
+<code>f"failed: {e}"</code>, <strong>turning tracing on would have made every indexing failure read
+"failed: generator didn't stop after throw()"</strong> instead of its cause. The tracer destroying
+the error it exists to record.</p>
+<div class="note"><span class="lbl">The rule</span>
+<p>Guard <em>setup and teardown</em>; never the body. Errors from traced code pass through
+untouched — only the tracer's own calls are ours to swallow. The span still closes, with the
+exception recorded on it.</p></div>
+
+<h3>Four traces, because there are four lifetimes</h3>
+<div class="tw"><table>
+<thead><tr><th>Trace</th><th>Spans</th><th>Why separate</th></tr></thead>
+<tbody>
+<tr><td><code>query</code></td><td>load_context → classify_intent → retrieve → resolve_subject → graph_facts → build_prompt → llm_answer → llm_summarize → save_turn</td><td>One request. <strong>Both</strong> LLM calls are typed as generations — tracing only the first understates cost by the summariser.</td></tr>
+<tr><td><code>index</code></td><td>load_previous_index → discover_parse_chunk → prune_stale → embed → graph → persist</td><td>A background job. ~89% of all compute.</td></tr>
+<tr><td><code>acquire</code></td><td>clone → enforce_limits → index → cleanup</td><td>A worker thread outliving the request that started it.</td></tr>
+<tr><td><code>snippet</code></td><td>load_chunks → resolve_pointer → staleness_check</td><td>Fired minutes after the answer that cited it.</td></tr>
+</tbody></table></div>
+
+<h4>Why indexing opens its own root</h4>
+<p>A good interview answer, because the reasoning is not obvious. Indexing is dispatched with
+<code>loop.run_in_executor(...)</code>, and — unlike <code>asyncio.to_thread</code>, which copies
+the caller's <code>contextvars</code> — <strong><code>run_in_executor</code> does not</strong>. A
+trace opened in the request would therefore never reach the worker thread. So the job opens its own
+root and carries <code>job_id</code> as trace metadata, which is what ties a trace back to the job a
+client is polling.</p>
+<p>That forwarding exposed a second problem: <code>JobRunner.submit(job_id, fn, *args, **kwargs)</code>
+has a <code>job_id</code> of its own, so passing the callee's through <code>**kwargs</code> raised
+<em>“multiple values for argument 'job_id'”</em>. Its own parameters are now positional-only
+(<code>def submit(self, job_id, fn, /, *args, ...)</code>) — a generic dispatcher should not shadow
+its callee's parameter names.</p>
+
+<h4>A GitHub import produces two traces, not one</h4>
+<pre>resolve_repository     <span class="c"># inside the request, before the 202</span>
+  ├─ validate_url
+  └─ ls_remote
+
+acquire                <span class="c"># on a worker thread, afterwards</span>
+  ├─ clone
+  ├─ enforce_limits
+  ├─ index             <span class="c"># the six stages nest here</span>
+  │    ├─ load_previous_index
+  │    ├─ discover_parse_chunk
+  │    ├─ prune_stale
+  │    ├─ embed
+  │    ├─ graph
+  │    └─ persist
+  └─ cleanup           <span class="c"># in a finally — a failed import leaves no clone</span></pre>
+<p>They are different traces because they have different lifetimes. Queries, by contrast, are grouped
+into a <strong>session per conversation</strong>, so a thread reads as one session.</p>
+
+<h3>Scores: computed, not judged</h3>
+<p>Every per-query score is computed locally from the answer and the index — no judge model, no extra
+API call, no added latency.</p>
+<div class="tw"><table>
+<thead><tr><th>Score</th><th>Question it answers</th></tr></thead>
+<tbody>
+<tr><td><code>citation_validity</code></td><td>Do the cited files exist in the index?</td></tr>
+<tr><td><code>citation_line_validity</code></td><td>Do the cited line ranges exist in those files?</td></tr>
+<tr><td><code>path_grounding</code></td><td>Is every path in the prose one the model was shown?</td></tr>
+<tr><td><code>graph_recall</code> / <code>graph_precision</code></td><td>Did it name the real callers, and only real ones?</td></tr>
+<tr><td><code>retrieval_hit</code></td><td>Was the subject of the question actually retrieved?</td></tr>
+<tr><td><code>prompt_budget_used</code></td><td>How close to the character budget did the prompt get?</td></tr>
+<tr><td><code>facts_truncated</code></td><td>Were graph facts cut to fit the budget?</td></tr>
+<tr><td><code>degraded</code></td><td>Was this assembled from a template because no LLM was reachable?</td></tr>
+<tr><td><code>user_feedback</code></td><td><strong>Did it actually help?</strong></td></tr>
+</tbody></table></div>
+<div class="note"><span class="lbl">Omitted, not defaulted</span>
+<p>A score that cannot be computed — no citations, no graph adjudication — is left off the trace
+rather than recorded as zero. Defaulting would make the dashboard average an average over queries
+the metric was meaningless for, which is worse than having no number.</p></div>
+
+<h4>The one score the others cannot replace</h4>
+<p>Every score above is computable from the answer and the index, and <em>all of them can be perfect
+for an answer that did not help</em>. That gap is what the 👍/👎 on each answer closes. Up scores 1
+and down scores 0, so the average reads directly as a satisfaction rate.</p>
+<p>Two implementation details matter. Feedback arrives long after the trace closed, so the trace id
+is stamped on the stored assistant turn and the score is attached by id
+(<code>create_score(trace_id=…)</code>) — a thumbs-down is one click from the retrieval that caused
+it. And the rating is addressed by the message's <code>seq</code>, not its position in the rendered
+array: a thread read back with <code>?message_limit=N</code> returns a <em>tail slice</em>, so index
+0 is not message 0, and index-addressing would have attached ratings to the wrong answer.</p>
+<p>Feedback is stored on the turn <strong>whether or not Langfuse is reachable</strong>, and the
+endpoint reports <code>traced: true|false</code> rather than pretending. Langfuse is where feedback
+is analysed, not where it lives.</p>
+
+<h3>Why RAGAS runs offline</h3>
+<p>Almost every RAGAS metric is LLM-as-judge — faithfulness decomposes an answer into claims and
+checks each one, so six metrics over one query can mean 15–30 LLM calls. This system already makes
+one call per query and is rate-limited on Groq. Running RAGAS inline would worsen the exact problem
+the prompt budget exists to fix, so it runs as a <strong>batch job against a dataset, with a
+separate judge provider</strong>, and pushes its metrics back as scores on the recorded traces.</p>
+
+<h3>What a trace is actually read for</h3>
+<p>Two fields carry most of the diagnostic value:</p>
+<ul>
+<li><code>match</code> on a <code>snippet</code> trace — <code>exact</code> means the citation
+resolved to the symbol it named; <code>nearest</code> means the reader was shown code <em>near</em>
+what was cited. Nothing else in the system reports that.</li>
+<li><code>reused_files</code> vs <code>parsed_files</code> on an <code>index</code> trace — the claim
+the whole incremental path rests on. A sync that re-parses everything is a sync that is silently
+broken, and it looks identical from outside.</li>
+</ul>
+</section>
+
+<!-- ============================================ 12 -->
 <section id="numbers">
-<h2><span class="num">11</span>Numbers worth remembering</h2>
+<h2><span class="num">12</span>Numbers worth remembering</h2>
 <p>All measured on this system, not estimated.</p>
 <div class="tw"><table>
 <thead><tr><th>Operation</th><th>Cost</th><th>Note</th></tr></thead>
@@ -918,9 +1045,9 @@ index is still answerable, so a network hiccup should not destroy it.</p></div>
 </tbody></table></div>
 </section>
 
-<!-- ============================================ 12 -->
+<!-- ============================================ 13 -->
 <section id="defend">
-<h2><span class="num">12</span>Defending the design</h2>
+<h2><span class="num">13</span>Defending the design</h2>
 <p class="lede">The questions most likely to be asked, and the honest answer to each.</p>
 
 <h3>"Why not just embed the files?"</h3>

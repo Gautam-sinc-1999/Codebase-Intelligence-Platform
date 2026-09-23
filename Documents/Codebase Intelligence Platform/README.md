@@ -32,6 +32,7 @@ list is injected as authoritative fact.
 - [Verifying it works](#verifying-it-works)
 - [Using it](#using-it)
 - [Tests](#tests)
+- [Observability](#observability)
 - [API reference](#api-reference)
 - [Project layout](#project-layout)
 - [Troubleshooting](#troubleshooting)
@@ -179,6 +180,11 @@ MAX_PROMPT_TOKENS=5000            # budget for the whole prompt
 # ── Security (optional) ───────────────────────────────────────
 # API_KEY=                        # set to require X-API-Key on every route
 # CORS_ORIGINS=http://localhost:3000
+
+# ── Observability (optional) — see the Observability section ──
+# LANGFUSE_PUBLIC_KEY=pk-lf-...   # tracing stays off unless both keys are set
+# LANGFUSE_SECRET_KEY=sk-lf-...
+# LANGFUSE_HOST=http://localhost:3001
 ```
 
 **Without an LLM key** the system still works: every answer is assembled from the retrieved chunks
@@ -320,6 +326,90 @@ every repository id written and deleting exactly those — never by an allowlist
 
 ---
 
+## Observability
+
+Tracing is **optional and off by default**. With no keys set the product behaves identically — every
+call into the tracer is guarded, because a dashboard is for the developer and an unreachable one
+must never cost a user their answer.
+
+### Turning it on
+
+Langfuse is in `docker-compose.yml` but is **not** part of the default stack — it is four containers
+(the app, plus Postgres, ClickHouse and MinIO), so start it only when you want to look at traces:
+
+```bash
+docker compose up -d langfuse
+```
+
+Open **http://localhost:3001** (3001, not 3000 — the frontend dev server owns 3000), create a
+project, and put its keys in `backend/.env`:
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=http://localhost:3001
+```
+
+Nothing is traced until **both** keys are present. `GET /` reports whether tracing resolved.
+
+### What gets traced
+
+Four trace types, because the system has four things worth watching and they have different
+lifetimes:
+
+| Trace | Spans | Why it exists |
+|---|---|---|
+| `query` | `load_context → classify_intent → retrieve → resolve_subject → graph_facts → build_prompt → llm_answer → llm_summarize → save_turn` | The whole answer path. Both LLM calls are typed as generations, so cost is complete — tracing only the first understates it by the summariser. |
+| `index` | `load_previous_index → discover_parse_chunk → prune_stale → embed → graph → persist` | Where ~89% of the compute goes. Nobody watches it live, which is exactly why a trace beats a log line. |
+| `acquire` | `clone → enforce_limits → index → cleanup` | A GitHub import or sync. The `index` spans nest inside, so one trace covers the whole job. |
+| `snippet` | `load_chunks → resolve_pointer → staleness_check` | Every citation expand, including whether the citation still points at the code it was written against. |
+
+A GitHub import produces **two** traces, not one: `resolve_repository` (URL validation and
+`ls-remote`, inside the request, before the 202) and `acquire` (on a worker thread afterwards).
+They have different lifetimes, so they are different traces.
+
+Queries are grouped into a **session** per conversation, so a thread reads as one session rather
+than a scatter of unrelated traces.
+
+### Scores
+
+Attached to every query trace, computed locally — no judge model, no extra API calls:
+
+| Score | Question it answers |
+|---|---|
+| `citation_validity` | Do the cited files exist in the index? |
+| `citation_line_validity` | Do the cited line ranges exist in those files? |
+| `path_grounding` | Is every path in the prose one the model was actually shown? |
+| `graph_recall` / `graph_precision` | Did the answer name the real callers, and only real ones? |
+| `retrieval_hit` | Was the subject of the question actually retrieved? |
+| `prompt_budget_used` | How close to the character budget did the prompt get? |
+| `facts_truncated` | Were graph facts cut to fit the budget? |
+| `degraded` | Was this assembled from a template because no LLM was reachable? |
+| `user_feedback` | **Did it actually help?** |
+
+A score that cannot be computed is **omitted rather than defaulted**, so an average over the
+dashboard is an average over the queries the metric meant something for.
+
+`user_feedback` is the only one that measures usefulness. Every other score can be perfect for an
+answer that did not help. It comes from the 👍/👎 on each answer, scored 1 and 0 so the average
+reads as a satisfaction rate, and it is attached to that answer's own trace — a thumbs-down is one
+click from the retrieval that caused it.
+
+Feedback is stored on the conversation turn **whether or not Langfuse is reachable**; the endpoint
+reports `traced: true|false` rather than pretending. Langfuse is where feedback is analysed, not
+where it lives.
+
+### Reading a trace
+
+Two things are worth looking at first:
+
+- **`match` on a `snippet` trace.** `exact` means the citation resolved to the symbol it named;
+  `nearest` means the reader was shown code *near* what was cited. Nothing else reports that.
+- **`reused_files` vs `parsed_files` on an `index` trace.** This is the claim the incremental path
+  rests on — a sync that re-parses everything is a sync that is silently broken.
+
+---
+
 ## API reference
 
 | Method | Path | Purpose |
@@ -343,6 +433,7 @@ every repository id written and deleting exactly those — never by an allowlist
 | `DELETE` | `/api/conversations/{id}` | Delete |
 | `POST` | `/api/conversations/{id}/messages` | Ask a question |
 | `POST` | `/api/conversations/{id}/messages/stream` | Same, as server-sent events |
+| `POST` | `/api/conversations/{id}/messages/{seq}/feedback` | Rate an answer 👍/👎, with an optional comment |
 | `POST` | `/api/conversations/{id}/ack-drift` | Stay on the current version |
 | `GET` | `/api/graph/{id}` | Graph data, with truncation reported |
 
@@ -366,13 +457,14 @@ backend/app/
   graph/         neo4j_client (+ NetworkX fallback) · feature_tracer
   memory/        mongo_thread_store · conversation_memory · summarizer
   vector/        chromadb_client
+  observability/ tracing (guarded Langfuse wrapper) · scorers
   core/          config · database · jobs · security
 
 frontend/src/
   components/    Sidebar · ChatWindow · MessageItem · DependencyGraph
                  RepoUploader · DriftBanner
   services/      api.js
-  lib/           drift.js
+  lib/           drift.js · feedback.js
 
 data/            indexes/ · chroma_db/ · repositories/   (git-ignored)
 ```
@@ -416,4 +508,21 @@ They should not — the suite removes its temp root and sweeps roots older than 
 |---|---|
 | `architecture.html` | Full internals — indexing pipeline, call graph, retrieval, the real prompt and a traced query with measured timings |
 | `github-integration-plan.md` | Design and build log for GitHub import, branch selection and drift detection |
+| `langfuse_plan.md` | Observability design — what is traced, which scores are computed locally vs by a judge model, and why RAGAS runs offline |
 | `implementation_plan.md` | Original build plan |
+
+
+
+
+gautamkoshta@Gautams-MacBook-Air ~ % brew services stop redis 
+==> Downloading Homebrew API data
+✔︎ JSON API packages.arm64_tahoe.jws.json            Downloaded   15.5MB/ 15.5MB
+Stopping `redis`... (might take a while)
+==> Successfully stopped `redis` (label: sh.brew.redis)
+gautamkoshta@Gautams-MacBook-Air ~ % brew services stop mongodb-community@8.0
+Stopping `mongodb-community@8.0`... (might take a while)
+==> Successfully stopped `mongodb-community@8.0` (label: homebrew.mxcl.mongodb-c
+gautamkoshta@Gautams-MacBook-Air ~ % brew services stop neo4j
+Stopping `neo4j`... (might take a while)
+==> Successfully stopped `neo4j` (label: homebrew.mxcl.neo4j)
+gautamkoshta@Gautams-MacBook-Air ~ % 

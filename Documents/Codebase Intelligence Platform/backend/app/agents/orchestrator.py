@@ -9,9 +9,11 @@ import httpx
 from app.core.config import settings
 from app.retrieval.intent_classifier import QueryIntentClassifier
 from app.retrieval.hybrid_retriever import HybridRetriever
+from app.retrieval.reranker import CodeReranker
 from app.graph.feature_tracer import FeatureTracer
 from app.agents.impact_analyzer import ChangeImpactAnalyzer
 from app.graph.neo4j_client import neo4j_client
+from app.observability import span, generation
 from app.memory.conversation_memory import ConversationMemory
 from app.memory.summarizer import ConversationSummarizer
 
@@ -127,6 +129,12 @@ class CodebaseAgentOrchestrator:
 
         messages.append({"role": "user", "content": user_prompt})
         return messages
+
+    @classmethod
+    def _resolve_provider_model(cls) -> Optional[str]:
+        """The model name for tracing, or None when no provider is configured."""
+        provider = cls._resolve_provider()
+        return provider.get("model") if provider else None
 
     @classmethod
     def _resolve_provider(cls) -> Optional[Dict[str, Any]]:
@@ -978,22 +986,41 @@ class CodebaseAgentOrchestrator:
         history = history or []
 
         # Step 1: Intent Classification
-        intent_info = QueryIntentClassifier.classify(query)
-        intent = intent_info["intent"]
+        with span("classify_intent", input={"query": query}) as _sp:
+            intent_info = QueryIntentClassifier.classify(query)
+            intent = intent_info["intent"]
+            _sp.update(output=intent_info)
 
         # Step 2: Hybrid Retrieval
-        retrieved_chunks = HybridRetriever.retrieve(
-            repository_id=repository_id,
-            query=query,
-            all_chunks=all_chunks,
-            top_k=6
-        )
+        with span("retrieve", input={"query": query, "top_k": 6}) as _sp:
+            retrieved_chunks = HybridRetriever.retrieve(
+                repository_id=repository_id,
+                query=query,
+                all_chunks=all_chunks,
+                top_k=6
+            )
+            # The per-chunk ranking is computed on every query and then thrown away. It is the
+            # first thing anyone wants when an answer cites the wrong code.
+            _sp.update(output={
+                "count": len(retrieved_chunks),
+                "chunks": [
+                    {
+                        "symbol": c.get("symbol"),
+                        "file_path": c.get("file_path"),
+                        "lines": f"{c.get('start_line')}-{c.get('end_line')}",
+                        "entity_type": c.get("entity_type"),
+                        **(CodeReranker.last_scores.get(c.get("chunk_id"), {})),
+                    }
+                    for c in retrieved_chunks
+                ],
+            })
 
         # Resolution order for the subject of the question:
         #   1. a symbol the user named explicitly
         #   2. the conversation's current subject, when the query refers back to it ("who calls it?")
         #   3. the top-ranked retrieval hit
-        target_feature = cls._extract_target_feature(query, repository_id, all_chunks)
+        with span("resolve_subject", input={"query": query}) as _subject_span:
+            target_feature = cls._extract_target_feature(query, repository_id, all_chunks)
         carried_symbol = working_context.get("current_symbol", "")
 
         target_symbol = cls._extract_target_symbol(query, all_chunks)
@@ -1014,6 +1041,13 @@ class CodebaseAgentOrchestrator:
         # formatters say "I don't know" rather than inventing one from the sample repo.
         current_feature = target_feature or working_context.get("current_feature", "")
         current_symbol = target_symbol or working_context.get("current_symbol", "")
+
+        _subject_span.update(output={
+            "symbol": current_symbol,
+            "feature": current_feature,
+            "file": target_file,
+            "explicit": symbol_is_explicit,
+        })
 
         updated_working_ctx = {
             "current_feature": current_feature,
@@ -1080,20 +1114,47 @@ class CodebaseAgentOrchestrator:
         if target_file:
             subject_for_facts = ""
 
-        graph_facts = cls._build_graph_facts(
-            intent, subject_for_facts, repository_id, execution_flow, impact_analysis,
-            target_file=target_file, all_chunks=all_chunks,
-        )
+        with span("graph_facts", input={"symbol": subject_for_facts, "file": target_file}) as _sp:
+            graph_facts = cls._build_graph_facts(
+                intent, subject_for_facts, repository_id, execution_flow, impact_analysis,
+                target_file=target_file, all_chunks=all_chunks,
+            )
+            # Captured for scoring as well as tracing: for a dependency question this list is the
+            # correct answer, so `graph_recall` can be computed without a judge.
+            graph_callers = []
+            if subject_for_facts and repository_id:
+                try:
+                    graph_callers = neo4j_client.get_callers(subject_for_facts, repository_id)
+                except Exception:
+                    graph_callers = []
+            # Deliberately not reporting truncation here: `_fit_to_budget` runs after this span
+            # closes, so anything this block claimed about it would describe the wrong moment.
+            # The accurate flag is set on `prepared` below, after trimming.
+            _sp.update(output={
+                "caller_count": len(graph_callers),
+                "callers": [c.get("caller_symbol") for c in graph_callers][:40],
+                "facts_chars_before_budget": len(graph_facts),
+            })
         # `MAX_GRAPH_FACTS` caps each block; this caps the sum of them. On a helper called from
         # 120 files the three blocks that qualify produced 11,684 characters between them —
         # roughly 2,900 tokens of a 8,000-token-per-minute budget, before any source code.
         budget = cls._char_budget()
         graph_facts = cls._fit_to_budget(
             graph_facts, int(budget * cls.FACTS_BUDGET_SHARE), "static analysis facts")
-        ctx_text = cls._build_context(
-            query, current_feature, existing_summary, sources, graph_facts,
-            reserved_chars=len(sys_prompt),
-        )
+        with span("build_prompt") as _sp:
+            ctx_text = cls._build_context(
+                query, current_feature, existing_summary, sources, graph_facts,
+                reserved_chars=len(sys_prompt),
+            )
+            _code_chars = len(ctx_text) - len(ctx_text.split("Retrieved Code Context")[0])
+            _sp.update(output={
+                "system_chars": len(sys_prompt),
+                "facts_chars": len(graph_facts),
+                "code_chars": _code_chars,
+                "context_chars": len(ctx_text),
+                "budget_chars": cls._char_budget(),
+                "approx_tokens": (len(sys_prompt) + len(ctx_text)) // cls.CHARS_PER_TOKEN,
+            })
 
         # Everything up to here is shared with the streaming path; `_finish` below turns a raw
         # LLM response (or its absence) into the final payload.
@@ -1113,6 +1174,12 @@ class CodebaseAgentOrchestrator:
             "current_feature": current_feature,
             "current_symbol": current_symbol,
             "retrieved_chunks": retrieved_chunks,
+            "all_chunks": all_chunks,
+            # Carried for scoring, not for answering: the graph's own view of the correct answer.
+            "graph_callers": graph_callers,
+            "graph_facts_truncated": "truncated to fit" in graph_facts,
+            "prompt_chars": len(sys_prompt) + len(ctx_text),
+            "budget_chars": cls._char_budget(),
         }
 
         if _prepare_only:
@@ -1121,7 +1188,24 @@ class CodebaseAgentOrchestrator:
         # Step 5: Execute LLM reasoning or fallback
         llm_response = ""
         if settings.GROQ_API_KEY or settings.OPENAI_API_KEY:
-            llm_response = await cls.call_llm_provider(sys_prompt, ctx_text, history=history)
+            provider = cls._resolve_provider()
+            with generation(
+                "llm_answer",
+                model=(provider or {}).get("model"),
+                input={"system": sys_prompt, "user": ctx_text},
+                metadata={"intent": intent, "provider": (provider or {}).get("name")},
+            ) as _gen:
+                llm_response = await cls.call_llm_provider(sys_prompt, ctx_text, history=history)
+                # Token counts are estimated from characters — the providers' usage blocks are not
+                # currently threaded back through `call_llm_provider`. Good enough to trend cost;
+                # replace with real usage when that plumbing exists.
+                _gen.update(
+                    output=llm_response,
+                    usage_details={
+                        "input": (len(sys_prompt) + len(ctx_text)) // cls.CHARS_PER_TOKEN,
+                        "output": len(llm_response or "") // cls.CHARS_PER_TOKEN,
+                    },
+                )
 
         return await cls._finish(prepared, llm_response)
 
@@ -1166,14 +1250,22 @@ class CodebaseAgentOrchestrator:
         degraded = not llm_response
         answer_markdown = llm_response or cls.fallback_answer(prepared)
 
-        updated_summary = await ConversationSummarizer.update(
-            existing_summary=prepared["existing_summary"],
-            messages=prepared["history"],
-            user_msg=prepared["query"],
-            assistant_msg=answer_markdown,
-            working_ctx=prepared["working_context"],
-            llm_call=cls.call_llm_provider if (settings.GROQ_API_KEY or settings.OPENAI_API_KEY) else None,
-        )
+        # The second LLM call of the turn. Untraced, it made every cost figure understated by an
+        # unknown amount, because it fires only on turns where `should_summarize` says so.
+        with generation("llm_summarize", model=cls._resolve_provider_model()) as _sum_gen:
+            updated_summary = await ConversationSummarizer.update(
+                existing_summary=prepared["existing_summary"],
+                messages=prepared["history"],
+                user_msg=prepared["query"],
+                assistant_msg=answer_markdown,
+                working_ctx=prepared["working_context"],
+                llm_call=cls.call_llm_provider if (settings.GROQ_API_KEY or settings.OPENAI_API_KEY) else None,
+            )
+            _sum_gen.update(
+                output=updated_summary,
+                metadata={"summary_chars": len(updated_summary or ""),
+                          "changed": updated_summary != prepared["existing_summary"]},
+            )
 
         return {
             "conversation_id": prepared["conversation_id"],
@@ -1182,6 +1274,12 @@ class CodebaseAgentOrchestrator:
             "answer": answer_markdown,
             # True when the answer came from the rule-based template rather than a model.
             "degraded": degraded,
+            # Carried for scoring, not for the client. The graph's caller list is the oracle
+            # `graph_recall` is measured against; the char counts feed `prompt_budget_used`.
+            "graph_callers": prepared.get("graph_callers", []),
+            "graph_facts_truncated": prepared.get("graph_facts_truncated", False),
+            "prompt_chars": prepared.get("prompt_chars", 0),
+            "budget_chars": prepared.get("budget_chars", 0),
             "degraded_reason": (
                 "The language model could not be reached (it may be rate-limited). "
                 "This answer was assembled directly from the indexed code — the files and line "

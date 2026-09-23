@@ -2,6 +2,7 @@ from typing import Dict, Any, List, Optional
 
 from app.core.database import redis_client
 from app.memory.mongo_thread_store import thread_store
+from app.observability import current_trace_id
 
 
 class ConversationMemory:
@@ -96,7 +97,14 @@ class ConversationMemory:
     @classmethod
     async def save_turn(
         cls, conversation_id: str, user_message: str, assistant_response: Dict[str, Any]
-    ) -> None:
+    ) -> int:
+        """
+        Writes a question and its answer, and returns the answer's `seq`.
+
+        Returned rather than discarded so the response can tell the client where the answer landed.
+        The alternative is the client inferring it from its own array length, which is wrong the
+        moment a thread is read back with a message limit.
+        """
         from datetime import datetime
         now = datetime.utcnow().isoformat()
 
@@ -120,7 +128,16 @@ class ConversationMemory:
         # turns before it describe different code from the turns after.
         if commit_sha:
             assistant_doc["commit_sha"] = commit_sha
-        await thread_store.append_messages(conversation_id, [user_doc, assistant_doc])
+
+        # Read from the ambient trace rather than passed in, so the buffered and the streaming
+        # path both record it without either having to remember to. Feedback arrives minutes
+        # after the trace has closed, and this id is the only way back to the retrieval that
+        # produced the answer someone is rating.
+        trace_id = current_trace_id()
+        if trace_id:
+            assistant_doc["trace_id"] = trace_id
+        total = await thread_store.append_messages(conversation_id, [user_doc, assistant_doc])
+        answer_seq = total - 1
 
         # The first question becomes the thread title, as it does in a chat sidebar — unless the
         # user has named it themselves, in which case their title stands for good.
@@ -139,6 +156,8 @@ class ConversationMemory:
         if summary:
             updates["summary"] = summary
         await thread_store.update_meta(conversation_id, **updates)
+
+        return answer_seq
 
         if working_context:
             await redis_client.set_state(conversation_id, working_context)

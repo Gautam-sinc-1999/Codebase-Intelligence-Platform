@@ -67,6 +67,14 @@ class FallbackMongoDBStore:
             self.collections[name] = []
         return FallbackCollection(self.collections[name], name, self)
 
+class _UpdateResult:
+    """The part of PyMongo's UpdateResult that callers of this store actually read."""
+
+    def __init__(self, matched_count: int = 0):
+        self.matched_count = matched_count
+        self.modified_count = matched_count
+
+
 class FallbackCollection:
     def __init__(self, data_list: List[Dict[str, Any]], name: str = "", store: Optional[FallbackMongoDBStore] = None):
         self.data = data_list
@@ -84,15 +92,18 @@ class FallbackCollection:
         return type("InsertOneResult", (), {"inserted_id": document.get("_id", document.get("id"))})()
 
     async def update_one(self, query: Dict[str, Any], update: Dict[str, Any], upsert: bool = False):
-        key, val = list(query.items())[0] if query else (None, None)
+        # Every key in the query has to match, as `find_one` and `delete_one` already require.
+        # Matching only the first key made a two-key query silently address the wrong document:
+        # `{"conversation_id": c, "seq": 3}` matched on the conversation alone and updated its
+        # *first* message, so feedback recorded against one answer landed on another.
         target = None
-        if key:
-            for item in self.data:
-                if item.get(key) == val:
-                    target = item
-                    break
+        for item in self.data:
+            if all(item.get(k) == v for k, v in query.items()):
+                target = item
+                break
+
         if not target and upsert:
-            target = {key: val} if key else {}
+            target = dict(query)
             self.data.append(target)
 
         if target:
@@ -107,6 +118,10 @@ class FallbackCollection:
                     else:
                         target[p_key].append(p_val)
             await self._persist()
+
+        # Reported like PyMongo's, so a caller can tell "no such document" from "updated" without
+        # knowing which store it is talking to.
+        return _UpdateResult(matched_count=1 if target else 0)
 
     async def find_one(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         for item in self.data:

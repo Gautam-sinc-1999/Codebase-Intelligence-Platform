@@ -25,6 +25,7 @@ from app.ingestion.ast_parser import MultiLanguageASTParser
 from app.ingestion.chunker import HierarchicalCodeChunker
 from app.vector.chromadb_client import chroma_store
 from app.core.jobs import indexing_jobs
+from app.observability import shutdown_tracing, tracing_enabled
 from app.graph.neo4j_client import neo4j_client
 from app.agents.orchestrator import close_http_client
 
@@ -101,6 +102,10 @@ async def lifespan(app: FastAPI):
             "so nothing is left half-written.",
             settings.SHUTDOWN_GRACE_SECONDS,
         )
+
+    # Flushed before the stores close: a queued trace dropped at exit is a trace of exactly the
+    # shutdown you wanted to look at.
+    shutdown_tracing()
 
     await close_http_client()
     # Closed deterministically rather than at interpreter teardown, where it can abort the
@@ -235,6 +240,7 @@ async def root(request: Request):
             "graph": "networkx-fallback" if neo4j_client.is_fallback else "neo4j",
         }
         payload["backends"] = backends
+        payload["tracing"] = "langfuse" if tracing_enabled() else "off"
         payload["degraded"] = [name for name, backend in backends.items() if "fallback" in backend]
 
         # Why, not just what. A missing client library and an unreachable server look identical

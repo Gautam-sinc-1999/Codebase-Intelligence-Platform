@@ -9,26 +9,19 @@ snippets show a handful of call sites while the graph has all of them.
 import pytest
 
 from app.agents.orchestrator import CodebaseAgentOrchestrator as Agent
+from app.observability.datasets import build_fixture_files
 
 
 @pytest.fixture
 def wide_repo(temp_repo):
-    """One helper called from many files — more call sites than retrieval will ever return."""
-    files = {"services/audit.py": "def record_audit(event, actor):\n    return {'e': event}\n"}
-    for i in range(1, 13):
-        files[f"services/module_{i}.py"] = (
-            "from services.audit import record_audit\n\n"
-            f"def operation_{i}(actor, payload):\n"
-            f"    record_audit('operation_{i}', actor)\n"
-            "    return payload\n"
-        )
-    files["api/handlers.py"] = (
-        "from services.audit import record_audit\n\n"
-        "def handle_request(request):\n"
-        "    record_audit('http_request', request.user)\n"
-        "    return {'ok': True}\n"
-    )
-    return temp_repo(files)
+    """
+    One helper called from many files — more call sites than retrieval will ever return.
+
+    Built from `app/observability/datasets.py` because the Langfuse `graph-grounding` dataset asks
+    about this same repository. One definition means the dataset's thirteen expected callers and
+    the fixture's thirteen actual callers cannot disagree.
+    """
+    return temp_repo(build_fixture_files())
 
 
 # ------------------------------------------------------------------ the facts block

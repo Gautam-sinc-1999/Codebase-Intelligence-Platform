@@ -210,11 +210,19 @@ async def test_streaming_emits_meta_then_tokens_then_done(api_client, sample_rep
                 events.append(json.loads(line[5:].strip()))
 
     kinds = [e["type"] for e in events]
-    assert kinds[0] == "meta" and kinds[-1] == "done"
+    assert kinds[0] == "meta"
     # Sources arrive before generation so the UI can render citations immediately.
     assert events[0]["sources"]
+
+    # `done` carries the answer and is emitted *before* the turn is written, so a failure to
+    # persist costs the reader their record of the answer but never the answer itself. `saved`
+    # therefore trails it, carrying the position the answer was written at — which is the only
+    # way the reader can rate an answer they just watched arrive without reloading first.
+    assert kinds[-2:] == ["done", "saved"]
+    done = events[-2]
     streamed = "".join(e["text"] for e in events if e["type"] == "token")
-    assert streamed == events[-1]["answer"]
+    assert streamed == done["answer"]
+    assert isinstance(events[-1]["answer_seq"], int)
 
 
 async def test_streamed_turn_is_persisted(api_client):

@@ -8,42 +8,26 @@ are the reason this file exists.
 """
 import pytest
 
+from app.observability.datasets import INTENT_CASES, INTENT_TRAP_CASES
 from app.retrieval.intent_classifier import QueryIntentClassifier as IC
+
+
+# The cases live in `app/observability/datasets.py` rather than here, because the Langfuse
+# evaluation dataset is seeded from the same list. Keeping two copies would let a case be fixed in
+# one place and left stale in the other — and the stale one would be the dataset, which is exactly
+# where a wrong label is hardest to notice.
 
 
 # ------------------------------------------------------------------ ordinary questions
 
-@pytest.mark.parametrize("query,intent", [
-    ("Where is authentication implemented?", "CODE_LOCATION"),
-    ("Where are the database migrations?", "CODE_LOCATION"),
-    ("Which file holds the retry logic?", "CODE_LOCATION"),
-    ("What depends on calculate_discount?", "DEPENDENCY_ANALYSIS"),
-    ("Who calls process_checkout?", "DEPENDENCY_ANALYSIS"),
-    ("What are the dependencies of the billing module?", "DEPENDENCY_ANALYSIS"),
-    ("If I change the discount logic what breaks?", "CHANGE_IMPACT"),
-    ("What will be affected if I modify the parser?", "CHANGE_IMPACT"),
-    ("How does checkout work?", "FEATURE_EXPLANATION"),
-    ("How do sessions get created?", "FEATURE_EXPLANATION"),
-    ("Walk me through the payment flow", "FEATURE_EXPLANATION"),
-    ("Why does the upload fail?", "DEBUGGING"),
-    ("What is the overall architecture?", "ARCHITECTURE"),
-    ("Give me an overview of the components", "ARCHITECTURE"),
-])
+@pytest.mark.parametrize("query,intent", INTENT_CASES)
 def test_ordinary_questions_land_on_the_right_intent(query, intent):
     assert IC.classify(query)["intent"] == intent
 
 
 # ------------------------------------------------------------------ the substring bug
 
-@pytest.mark.parametrize("query,fragment", [
-    ("Which parts are unchanged since last release?", "'unchanged' contains 'change'"),
-    ("Is the parser independent of the lexer?", "'independent' contains 'depend'"),
-    ("Describe the workflow engine", "'workflow' contains 'flow'"),
-    ("Summarise the changelog", "'changelog' starts with 'change'"),
-    ("What is a changepoint in this codebase?", "'changepoint' starts with 'change'"),
-    ("Explain the importer module", "'importer' contains 'import'"),
-    ("What does the classifier do?", "no keyword at all, only fragments"),
-])
+@pytest.mark.parametrize("query,fragment", INTENT_TRAP_CASES)
 def test_a_keyword_buried_inside_another_word_contributes_nothing(query, fragment):
     """
     Each of these routed retrieval down the wrong path before a single chunk was fetched.

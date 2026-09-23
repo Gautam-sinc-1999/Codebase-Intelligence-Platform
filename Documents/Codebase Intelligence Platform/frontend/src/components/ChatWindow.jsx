@@ -123,6 +123,7 @@ export function ChatWindow({
               key={idx}
               message={msg}
               repositoryId={activeConv ? activeConv.repository_id : ''}
+              conversationId={activeConv ? activeConv.conversation_id : ''}
             />
           ))
         )}

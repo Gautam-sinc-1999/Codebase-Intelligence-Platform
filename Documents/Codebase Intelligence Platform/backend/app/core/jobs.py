@@ -100,6 +100,7 @@ class JobRunner:
         self,
         job_id: str,
         fn: Callable[..., Any],
+        /,
         *args,
         on_success: Optional[Callable[[str, Any], Any]] = None,
         on_failure: Optional[Callable[[str, BaseException], Any]] = None,
@@ -111,6 +112,11 @@ class JobRunner:
         `on_success` / `on_failure` run on the event loop once the thread finishes, so they may be
         coroutines — which is what lets the caller record a result in Mongo, or purge the stores a
         failed index left behind, without either happening on a worker thread.
+
+        `job_id` and `fn` are positional-only so that this runner's own parameter names do not
+        shadow the callee's. Indexing takes a `job_id` argument of its own, and without the `/`
+        a caller forwarding it would get "multiple values for argument 'job_id'" rather than the
+        keyword reaching `fn`.
         """
         if self._closed:
             raise RuntimeError("Job runner has been shut down.")

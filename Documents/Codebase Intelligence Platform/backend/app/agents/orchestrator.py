@@ -14,6 +14,7 @@ from app.graph.feature_tracer import FeatureTracer
 from app.agents.impact_analyzer import ChangeImpactAnalyzer
 from app.graph.neo4j_client import neo4j_client
 from app.observability import span, generation
+from app.observability import prompts
 from app.memory.conversation_memory import ConversationMemory
 from app.memory.summarizer import ConversationSummarizer
 
@@ -949,11 +950,35 @@ class CodebaseAgentOrchestrator:
 
         collected: List[str] = []
         if settings.GROQ_API_KEY or settings.OPENAI_API_KEY:
-            async for delta in cls.stream_llm_provider(
-                prepared["sys_prompt"], prepared["ctx_text"], prepared["history"]
-            ):
-                collected.append(delta)
-                yield {"type": "token", "text": delta}
+            provider = cls._resolve_provider()
+            answer_prompt = prepared["answer_prompt"]
+            # The streamed call is a generation too. Without this it was the *only* LLM call in
+            # the system not typed as one — so the path the UI actually uses contributed no cost
+            # and, now, no prompt version either.
+            with generation(
+                "llm_answer",
+                model=(provider or {}).get("model"),
+                input={"system": prepared["sys_prompt"], "user": prepared["ctx_text"]},
+                metadata={"intent": prepared["intent"], "streamed": True,
+                          "provider": (provider or {}).get("name"),
+                          **answer_prompt.describe()},
+                prompt=answer_prompt.client,
+            ) as _gen:
+                async for delta in cls.stream_llm_provider(
+                    prepared["sys_prompt"], prepared["ctx_text"], prepared["history"]
+                ):
+                    collected.append(delta)
+                    yield {"type": "token", "text": delta}
+
+                streamed = "".join(collected)
+                _gen.update(
+                    output=streamed,
+                    usage_details={
+                        "input": (len(prepared["sys_prompt"]) + len(prepared["ctx_text"]))
+                        // cls.CHARS_PER_TOKEN,
+                        "output": len(streamed) // cls.CHARS_PER_TOKEN,
+                    },
+                )
 
         answer = "".join(collected)
         if not answer:
@@ -1079,27 +1104,11 @@ class CodebaseAgentOrchestrator:
                 impact_analysis = ChangeImpactAnalyzer.analyze_change_impact(target_sym, all_chunks)
 
         # Step 4: System Prompt - Conversational & Progressive Detail
-        sys_prompt = (
-            "You are a helpful, senior software engineer pair-programming with a developer onboarding to a codebase.\n"
-            "GROUNDING RULES (these override style):\n"
-            "A. Answer ONLY from the material in the user turn: the Static Analysis Facts and the "
-            "Retrieved Code Context. Both come from the repository the developer is asking about — "
-            "the facts from its parsed call graph, the context verbatim from its source.\n"
-            "A1. The Static Analysis Facts are AUTHORITATIVE and COMPLETE for what they state. The "
-            "snippets are the top matches for this question, not the whole repository, so they will "
-            "often show fewer call sites than the facts list. When the two appear to disagree, "
-            "follow the facts. Never describe a list given in the facts as partial, as 'examples', "
-            "or as 'a handful' — report it as the complete set it is, and give the count.\n"
-            "B. Never invent file paths, symbol names, line numbers, or behaviour that is not visible in that context. "
-            "If the context does not contain the answer, say so plainly and ask which file or symbol to look at.\n"
-            "C. When you cite a location, use the exact path and line range shown in the context header.\n"
-            "STYLE:\n"
-            "1. Answer in natural, friendly conversational language first. Do NOT dump huge markdown templates or full code blocks right away unless explicitly asked.\n"
-            "2. Provide a clear, concise summary of how the code or feature works (2-4 sentences).\n"
-            "3. Mention key files and function names naturally (e.g. 'Checkout starts in `Checkout.jsx` and calls `checkout_controller.py`').\n"
-            "4. At the end, offer 2 relevant follow-up options if the user wants deeper details (e.g., line numbers, full execution flow, or change impact analysis).\n"
-            "5. If the user is asking a follow-up question, give specific details directly answering their question."
-        )
+        # Fetched by name so the wording can be versioned and rolled back without a deploy; the
+        # in-code text in `observability/prompts.py` is the fallback and still defines behaviour
+        # whenever Langfuse is unreachable or unseeded.
+        answer_prompt = prompts.get(prompts.ANSWER)
+        sys_prompt = answer_prompt.text
 
         # For a dependency or impact question the subject *is* the question, so the best
         # available guess is worth using. For anything else, only a subject the user actually
@@ -1164,6 +1173,9 @@ class CodebaseAgentOrchestrator:
             "intent": intent,
             "query": query,
             "sys_prompt": sys_prompt,
+            # Carried so the streaming path can link its generation to the same version the
+            # buffered path used; otherwise half the traffic records no prompt version at all.
+            "answer_prompt": answer_prompt,
             "ctx_text": ctx_text,
             "history": history,
             "existing_summary": existing_summary,
@@ -1193,7 +1205,9 @@ class CodebaseAgentOrchestrator:
                 "llm_answer",
                 model=(provider or {}).get("model"),
                 input={"system": sys_prompt, "user": ctx_text},
-                metadata={"intent": intent, "provider": (provider or {}).get("name")},
+                metadata={"intent": intent, "provider": (provider or {}).get("name"),
+                          **answer_prompt.describe()},
+                prompt=answer_prompt.client,
             ) as _gen:
                 llm_response = await cls.call_llm_provider(sys_prompt, ctx_text, history=history)
                 # Token counts are estimated from characters — the providers' usage blocks are not

@@ -188,7 +188,19 @@
       "Bash(perl -0pi -e 's/    if norm_a == 0 or norm_b == 0:\\\\n        return 0\\\\.0\\\\n//' app/observability/ragas_metrics.py)",
       "Bash(perl -0pi -e 's/        client, RELEVANCY_PROMPT\\\\.format\\\\\\(answer=answer, n=n\\\\\\)/        client, RELEVANCY_PROMPT.format\\(answer=answer + \" \" + question, n=n\\)/' app/observability/ragas_metrics.py)",
       "Bash(perl -0pi -e 's/    from app\\\\.vector\\\\.chromadb_client import ChromaVectorStore\\\\n\\\\n    return ChromaVectorStore\\\\.embed_texts\\\\\\(texts\\\\\\)/    from app.vector.chromadb_client import NoSuchStore\\\\n\\\\n    return NoSuchStore.embed_texts\\(texts\\)/' app/observability/ragas_metrics.py)",
-      "Bash(cp /tmp/rm2.bak app/observability/ragas_metrics.py)"
+      "Bash(cp /tmp/rm2.bak app/observability/ragas_metrics.py)",
+      "Bash(../venv/bin/python -m py_compile app/agents/orchestrator.py)",
+      "Bash(../venv/bin/python -m py_compile app/memory/summarizer.py app/agents/orchestrator.py app/observability/prompts.py)",
+      "Bash(../venv/bin/python -m py_compile scripts/seed_prompts.py)",
+      "Bash(../venv/bin/python scripts/seed_prompts.py --status)",
+      "Bash(../venv/bin/python scripts/seed_prompts.py --dry-run)",
+      "Bash(../venv/bin/python -m pytest tests/test_prompts.py -q)",
+      "Bash(cp app/observability/prompts.py /tmp/pr.bak)",
+      "Bash(perl -0pi -e 's/    if getattr\\\\\\(managed, \"is_fallback\", False\\\\\\):/    if False:/' app/observability/prompts.py)",
+      "Bash(perl -0pi -e 's/    except Exception as e:\\\\n        logger\\\\.warning\\\\\\(\"Prompt .%s. v%s did not compile \\\\\\(%s\\\\\\); using the in-code text\\\\.\",\\\\n                       name, getattr\\\\\\(managed, \"version\", \"\\\\?\"\\\\\\), e\\\\\\)\\\\n        return ResolvedPrompt\\\\\\(name=name, text=fallback_text\\\\\\)/    except Exception:\\\\n        raise/' app/observability/prompts.py)",
+      "Bash(perl -0pi -e 's/    if not isinstance\\\\\\(text, str\\\\\\) or not text\\\\.strip\\\\\\(\\\\\\):/    if False:/' app/observability/prompts.py)",
+      "Bash(cp /tmp/pr.bak app/observability/prompts.py)",
+      "Bash(perl -0pi -e 's/            cache_ttl_seconds=settings\\\\.LANGFUSE_PROMPT_CACHE_TTL,/            cache_ttl_seconds=0,/' app/observability/prompts.py)"
     ],
     "additionalDirectories": [
       "/Users/gautamkoshta/Documents/Codebase Intelligence Platform/backend",

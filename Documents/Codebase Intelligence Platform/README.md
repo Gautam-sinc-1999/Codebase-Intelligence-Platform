@@ -399,6 +399,43 @@ Feedback is stored on the conversation turn **whether or not Langfuse is reachab
 reports `traced: true|false` rather than pretending. Langfuse is where feedback is analysed, not
 where it lives.
 
+### Prompt versioning
+
+The answering and summariser prompts can be **versioned in Langfuse instead of edited in code**.
+The text in `app/observability/prompts.py` stays the source of truth for behaviour; Langfuse holds
+copies that can be edited, labelled and rolled back.
+
+```bash
+../venv/bin/python scripts/seed_prompts.py --dry-run    # show them
+../venv/bin/python scripts/seed_prompts.py --promote    # push and make live
+../venv/bin/python scripts/seed_prompts.py --status     # which version is live now
+```
+
+**Versions are immutable and auto-increment; which one is live is decided by the `production`
+label.** Labels are unique across versions, so moving the label *is* the deploy — and the rollback:
+
+```bash
+# roll back to v3 — the running process picks it up within LANGFUSE_PROMPT_CACHE_TTL
+../venv/bin/python scripts/seed_prompts.py --name codebase-answer --promote-version 3
+```
+
+No restart, no redeploy. Each generation is linked to the prompt version that produced it, so the
+dashboard can group scores **by version** — which is what turns "faithfulness dropped" into "rule
+A1's rewording in v4 dropped faithfulness, revert to v3".
+
+Three deliberate constraints:
+
+- **The in-code text is always the fallback.** Langfuse unreachable, unseeded, or a prompt that
+  will not compile — all resolve to the literal. A prompt is not optional the way a trace is: an
+  answer without one is ungrounded, which is worse than an answer that is merely untraced.
+- **Creating a version is not deploying it.** Seeding leaves versions unlabelled unless you pass
+  `--promote`, because pointing live traffic at new wording is a separate decision.
+- **The RAGAS judge prompts are deliberately *not* managed.** A measuring instrument that can
+  change without a deploy makes every comparison across runs suspect — a "regression" might only
+  be the judge being reworded.
+
+Set `LANGFUSE_PROMPTS_ENABLED=false` to pin the in-code text without giving up tracing.
+
 ### Reading a trace
 
 Two things are worth looking at first:

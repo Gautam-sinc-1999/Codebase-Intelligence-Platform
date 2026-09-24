@@ -1,6 +1,9 @@
 import logging
 from typing import List, Dict, Any, Optional, Callable, Awaitable
 
+from app.observability import prompts
+from app.observability.prompts import SUMMARY_PROMPT
+
 logger = logging.getLogger("memory.summarizer")
 
 
@@ -32,15 +35,10 @@ class ConversationSummarizer:
     # update carries the turns in between.
     SUMMARY_EVERY_N_TURNS = 3
 
-    SYSTEM_PROMPT = (
-        "You maintain a running summary of a technical conversation between a developer and a "
-        "codebase assistant.\n"
-        "Write 3-5 sentences in plain prose capturing: which feature or area the developer is "
-        "investigating, the specific files and symbols established so far, any conclusions "
-        "reached, and what they were asking most recently.\n"
-        "Preserve exact file paths and symbol names — they are the thread of the investigation. "
-        "Do not invent anything that is not in the transcript. Output only the summary."
-    )
+    # The text itself lives in `observability/prompts.py`, where it can be versioned in Langfuse
+    # with this literal as the fallback. Kept as a class attribute so existing callers and tests
+    # that reference `SYSTEM_PROMPT` are unaffected.
+    SYSTEM_PROMPT = SUMMARY_PROMPT
 
     @classmethod
     def _transcript(cls, messages: List[Dict[str, Any]]) -> str:
@@ -142,7 +140,8 @@ class ConversationSummarizer:
                     f"Conversation transcript:\n{cls._transcript(full_history)}\n\n"
                     "Write the updated summary."
                 )
-                result = await llm_call(cls.SYSTEM_PROMPT, prompt)
+                summary_prompt = prompts.get(prompts.SUMMARY)
+                result = await llm_call(summary_prompt.text, prompt)
                 result = (result or "").strip()
 
                 if result:

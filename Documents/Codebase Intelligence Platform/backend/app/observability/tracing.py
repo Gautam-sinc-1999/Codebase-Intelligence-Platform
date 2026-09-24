@@ -203,18 +203,29 @@ def span(name: str, *, input: Any = None, metadata: Optional[Dict[str, Any]] = N
 @contextmanager
 def generation(name: str, *, model: Optional[str] = None, input: Any = None,
                metadata: Optional[Dict[str, Any]] = None,
-               model_parameters: Optional[Dict[str, Any]] = None):
+               model_parameters: Optional[Dict[str, Any]] = None,
+               prompt: Any = None):
     """
     An LLM call. Typed as a generation so Langfuse costs it from the model and token counts.
 
     There are **two** of these per turn — the answer, and the conversation summariser. Tracing only
     the first understates cost by an unknown amount.
+
+    `prompt` is the managed prompt object this call used, when there is one. It links the
+    generation to a specific prompt **version**, which is what lets the dashboard group scores by
+    version — the difference between being able to roll a prompt back and being able to tell that
+    it needed rolling back.
     """
     def _factory(client):
-        return client.start_as_current_observation(
-            name=name, as_type="generation", input=input, metadata=metadata,
-            model=model, model_parameters=model_parameters,
-        )
+        kwargs = {
+            "name": name, "as_type": "generation", "input": input, "metadata": metadata,
+            "model": model, "model_parameters": model_parameters,
+        }
+        # Passed only when present: an older SDK without the parameter would reject it, and a
+        # missing link is a smaller loss than a failed generation.
+        if prompt is not None:
+            kwargs["prompt"] = prompt
+        return client.start_as_current_observation(**kwargs)
 
     with _observe(f"Generation '{name}'", _factory) as g:
         yield g

@@ -59,6 +59,14 @@ class Settings:
     # itself rather than firing a dataset's worth of judgements at once.
     JUDGE_MAX_CONCURRENCY: int = int(os.getenv("JUDGE_MAX_CONCURRENCY", "2"))
     JUDGE_TIMEOUT_SECONDS: float = float(os.getenv("JUDGE_TIMEOUT_SECONDS", "60"))
+
+    # How long a prompt fetched from Langfuse is reused before checking for a new version.
+    # This is the lag between moving the `production` label and the running process using it —
+    # traded against putting a network call in front of every answer.
+    LANGFUSE_PROMPT_CACHE_TTL: int = int(os.getenv("LANGFUSE_PROMPT_CACHE_TTL", "300"))
+    # Set to "0"/"false" to ignore Langfuse-managed prompts entirely and always use the in-code
+    # text, without having to unset the Langfuse keys and lose tracing with them.
+    LANGFUSE_PROMPTS_ENABLED: str = os.getenv("LANGFUSE_PROMPTS_ENABLED", "true")
     
     # Authentication (opt-in). When API_KEY is set, every /api route requires it via the
     # X-API-Key header or an Authorization: Bearer token. Left unset, auth is disabled and a

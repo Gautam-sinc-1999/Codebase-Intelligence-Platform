@@ -200,7 +200,19 @@
       "Bash(perl -0pi -e 's/    except Exception as e:\\\\n        logger\\\\.warning\\\\\\(\"Prompt .%s. v%s did not compile \\\\\\(%s\\\\\\); using the in-code text\\\\.\",\\\\n                       name, getattr\\\\\\(managed, \"version\", \"\\\\?\"\\\\\\), e\\\\\\)\\\\n        return ResolvedPrompt\\\\\\(name=name, text=fallback_text\\\\\\)/    except Exception:\\\\n        raise/' app/observability/prompts.py)",
       "Bash(perl -0pi -e 's/    if not isinstance\\\\\\(text, str\\\\\\) or not text\\\\.strip\\\\\\(\\\\\\):/    if False:/' app/observability/prompts.py)",
       "Bash(cp /tmp/pr.bak app/observability/prompts.py)",
-      "Bash(perl -0pi -e 's/            cache_ttl_seconds=settings\\\\.LANGFUSE_PROMPT_CACHE_TTL,/            cache_ttl_seconds=0,/' app/observability/prompts.py)"
+      "Bash(perl -0pi -e 's/            cache_ttl_seconds=settings\\\\.LANGFUSE_PROMPT_CACHE_TTL,/            cache_ttl_seconds=0,/' app/observability/prompts.py)",
+      "Bash(docker compose *)",
+      "Bash(docker run *)",
+      "Bash(docker exec *)",
+      "Bash(curl -s -o /dev/null -w \"status %{http_code}\\\\n\" http://localhost:3001)",
+      "Bash(cp app/observability/tracing.py /tmp/tr.bak)",
+      "Bash(perl -0pi -e 's/from app\\\\.core import config as _config  # noqa: F401/pass  # mutated/' app/observability/tracing.py)",
+      "Bash(../venv/bin/python -m pytest tests/test_observability.py -q -p no:cacheprovider)",
+      "Bash(../venv/bin/python -m pytest tests/test_observability.py -q -k \"env_file\")",
+      "Bash(cp /tmp/tr.bak app/observability/tracing.py)",
+      "Bash(../venv/bin/python scripts/seed_prompts.py --promote)",
+      "Bash(../venv/bin/python scripts/seed_datasets.py)",
+      "Bash(../venv/bin/python /private/tmp/claude-501/-Users-gautamkoshta-Documents-Codebase-Intelligence-Platform/4aabc870-2af2-4faa-a66f-46c84b06c088/scratchpad/live/nest.py)"
     ],
     "additionalDirectories": [
       "/Users/gautamkoshta/Documents/Codebase Intelligence Platform/backend",

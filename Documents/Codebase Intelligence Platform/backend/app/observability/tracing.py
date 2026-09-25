@@ -28,6 +28,13 @@ import sys
 from contextlib import ExitStack, contextmanager, asynccontextmanager
 from typing import Any, Dict, Optional
 
+# Imported for its side effect: `app.core.config` is what reads `backend/.env` into the
+# environment, and the keys below are read with `os.getenv`. Without this, whether tracing works
+# depends on whether something *else* happened to import config first — the application does, so
+# the server traced correctly while a standalone script importing only this module silently found
+# no keys and reported "tracing is off".
+from app.core import config as _config  # noqa: F401
+
 logger = logging.getLogger("observability.tracing")
 
 _client = None

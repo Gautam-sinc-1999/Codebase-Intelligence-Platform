@@ -180,6 +180,38 @@ def test_a_failed_trace_setup_still_runs_the_body(monkeypatch):
     assert ran == [True]
 
 
+def test_importing_tracing_alone_loads_the_env_file():
+    """
+    Keys are read with `os.getenv`, and `backend/.env` reaches the environment only because
+    `app.core.config` loads it at import. Nothing else in this module's chain pulls config in, so
+    without an explicit import whether tracing worked depended on import *order*: the application
+    imports config early and traced fine, while a standalone script importing only this module
+    found no keys and reported "tracing is off" — with a log line that looked like the keys were
+    genuinely unset.
+
+    Run in a **subprocess** because it cannot be observed in this one: `conftest.py` imports
+    config long before any test runs, so in-process `sys.modules` always contains it and the
+    check passes whether or not the import exists. A clean interpreter is the only place the
+    dependency is visible.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    backend = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import app.observability.tracing, sys; "
+         "print('app.core.config' in sys.modules)"],
+        cwd=str(backend), capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[-500:]
+    assert result.stdout.strip() == "True", (
+        "importing tracing must pull in app.core.config so backend/.env is loaded "
+        "regardless of import order"
+    )
+
+
 def test_initialisation_is_attempted_once(monkeypatch):
     """A misconfigured deployment logs once at startup, not once per query."""
     monkeypatch.setattr(tracing, "_client", None)
@@ -278,6 +310,34 @@ def test_path_grounding_flags_a_path_the_model_never_saw():
     sources = [{"file_path": "svc/discount.py"}]
     assert scorers.path_grounding("See `svc/discount.py`.", sources) == 1.0
     assert scorers.path_grounding("See `svc/imaginary.py`.", sources) == 0.0
+
+
+def test_a_path_from_the_graph_facts_is_grounded_even_if_it_was_not_retrieved():
+    """
+    Found live, on a verified-correct answer that scored 0.38.
+
+    The prompt shows the model two things, and rule A1 tells it to report the complete caller
+    list from the *facts* even when the snippets show fewer. Scoring against the snippets alone
+    marked every caller retrieval did not happen to return as invented — so the metric fired
+    hardest exactly when the model did what it was told.
+    """
+    sources = [{"file_path": "services/module_1.py"}]
+    callers = [{"caller_symbol": "operation_2", "file_path": "services/module_2.py"},
+               {"caller_symbol": "handle_request", "file_path": "api/handlers.py"}]
+    answer = ("Called from `services/module_1.py`, `services/module_2.py` "
+              "and `api/handlers.py`.")
+
+    assert scorers.path_grounding(answer, sources) < 0.4, "the old behaviour, for contrast"
+    assert scorers.path_grounding(answer, sources, callers) == 1.0
+
+
+def test_an_invented_path_is_still_caught_when_graph_facts_are_present():
+    """Widening what counts as grounded must not stop it catching a genuine invention."""
+    sources = [{"file_path": "services/module_1.py"}]
+    callers = [{"caller_symbol": "operation_2", "file_path": "services/module_2.py"}]
+    answer = "Called from `services/module_1.py` and `services/fabricated.py`."
+
+    assert scorers.path_grounding(answer, sources, callers) == 0.5
 
 
 def test_retrieval_hit_reports_whether_the_subject_was_retrieved():

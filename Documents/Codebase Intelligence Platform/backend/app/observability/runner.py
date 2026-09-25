@@ -112,7 +112,11 @@ def execute(item_input: Dict[str, Any], metadata: Dict[str, Any], *,
         symbol = item_input.get("symbol", "")
 
         if mode == "answer":
-            return _answer_output(query, symbol, repository_id)
+            raise ValueError(
+                "answer mode runs the orchestrator, which is async — use `await aexecute(...)`. "
+                "This function stays synchronous because the facts path has no await in it and "
+                "is called from sync code."
+            )
         return _facts_output(query, symbol, repository_id, metadata)
 
     raise ValueError(f"No execution path for check '{check}'")
@@ -132,15 +136,33 @@ def _facts_output(query: str, symbol: str, repository_id: str,
     return {"callers": names, "caller_count": len(names), "facts": facts, "mode": "facts"}
 
 
-def _answer_output(query: str, symbol: str, repository_id: str) -> Dict[str, Any]:
-    """A real generated answer, for the metrics that can only be computed from prose."""
-    import asyncio
+async def aexecute(item_input: Dict[str, Any], metadata: Dict[str, Any], *,
+                   mode: str = "facts", fixture: Optional["GraphFixture"] = None) -> Dict[str, Any]:
+    """
+    The async form of `execute`, required for `answer` mode.
 
+    Generating an answer runs the orchestrator, which is a coroutine. The first version called it
+    with `asyncio.run` from inside `execute`, which works from a script and explodes with "cannot
+    be called from a running event loop" the moment a caller is already async — which the RAGAS
+    harness is. The two forms are kept separate rather than merged because the facts path has no
+    await in it and is called from synchronous code.
+    """
+    check = metadata.get("check")
+    if check == "graph_recall" and mode == "answer":
+        if fixture is None:
+            raise ValueError("graph_recall items need a GraphFixture to ask about")
+        return await _answer_output(item_input.get("query", ""),
+                                    item_input.get("symbol", ""), fixture.ensure())
+    return execute(item_input, metadata, mode=mode, fixture=fixture)
+
+
+async def _answer_output(query: str, symbol: str, repository_id: str) -> Dict[str, Any]:
+    """A real generated answer, for the metrics that can only be computed from prose."""
     from app.agents.orchestrator import CodebaseAgentOrchestrator as Agent
     from app.api.repositories import get_repository_chunks
 
     chunks = get_repository_chunks(repository_id)
-    result = asyncio.run(Agent.process_user_query(
+    result = await (Agent.process_user_query(
         repository_id=repository_id,
         conversation_id=f"eval_{abs(hash(query)) % 10_000_000}",
         query=query,
@@ -150,8 +172,23 @@ def _answer_output(query: str, symbol: str, repository_id: str) -> Dict[str, Any
         history=[],
     ))
     graph_callers = result.get("graph_callers", []) or []
+
+    # The facts block is rebuilt here because `process_user_query` does not return it, and the
+    # metrics need the *whole* context the model saw. Without it, every claim the answer takes
+    # from the graph looks unsupported: `context_entity_recall` reported 5 of 13 symbols present
+    # when all 13 were in the prompt, and `faithfulness` would have marked a correct answer down
+    # for the same reason. Scoring against a partial view of the context is not a strict judge,
+    # it is a wrong one.
+    from app.agents.orchestrator import CodebaseAgentOrchestrator as _Agent
+    try:
+        facts = _Agent._build_graph_facts("DEPENDENCY_ANALYSIS", symbol, repository_id, {}, {})
+    except Exception as e:
+        logger.warning("Could not rebuild the facts block for scoring: %s", e)
+        facts = ""
+
     return {
         "answer": result.get("answer", ""),
+        "facts": facts,
         "sources": result.get("sources", []),
         "intent": result.get("intent"),
         "degraded": bool(result.get("degraded")),

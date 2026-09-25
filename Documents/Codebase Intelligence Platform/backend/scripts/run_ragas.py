@@ -89,8 +89,8 @@ async def evaluate(dataset_names, only, limit, push) -> int:
                     tags=["ragas", dataset_name],
                 ):
                     tracing.set_trace_io(input=question)
-                    output = runner.execute(item["input"], item["metadata"],
-                                            mode="answer", fixture=fixture)
+                    output = await runner.aexecute(item["input"], item["metadata"],
+                                                   mode="answer", fixture=fixture)
                     tracing.set_trace_io(output=output.get("answer", ""))
                     trace_id = tracing.current_trace_id()
 
@@ -112,16 +112,14 @@ async def evaluate(dataset_names, only, limit, push) -> int:
                             "value": evaluation["value"], "comment": evaluation["comment"],
                         })
 
-                    for name, result in measured.items():
-                        tracing.score(name, result["value"], comment=result.get("comment"),
-                                      data_type="NUMERIC")
-
-                if push and trace_id:
-                    # Also attached by id, so a run remains scoreable even where the ambient trace
-                    # has already been flushed.
-                    for name, result in measured.items():
-                        tracing.score_trace(trace_id, name, result["value"],
-                                            comment=result.get("comment"), data_type="NUMERIC")
+                    # Pushed **once**, on the open trace. An earlier version also re-sent every
+                    # score by trace id as a belt-and-braces measure; both calls succeeded, so
+                    # each metric landed twice and every dashboard average was computed over
+                    # doubled rows — a silent 2x that looks like real data.
+                    if push:
+                        for name, result in measured.items():
+                            tracing.score(name, result["value"],
+                                          comment=result.get("comment"), data_type="NUMERIC")
 
                 rows.append((question, output.get("degraded"), measured))
                 for name, result in measured.items():

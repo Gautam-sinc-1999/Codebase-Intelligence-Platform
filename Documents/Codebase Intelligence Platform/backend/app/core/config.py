@@ -54,7 +54,11 @@ class Settings:
     JUDGE_BASE_URL: str = os.getenv(
         "JUDGE_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
     )
-    JUDGE_MODEL: str = os.getenv("JUDGE_MODEL", "gemini-2.0-flash")
+    # Pinned, not `gemini-flash-latest`. A judge is a measuring instrument: if it changes
+    # underneath you, a metric moving between runs no longer means the system changed.
+    # The cost is that Google retires models — 2.0-flash 404d with "no longer available",
+    # which the guards turned into four omitted metrics rather than four zeros.
+    JUDGE_MODEL: str = os.getenv("JUDGE_MODEL", "gemini-3.6-flash")
     # Free tiers limit requests per minute far more tightly than per day, so the harness paces
     # itself rather than firing a dataset's worth of judgements at once.
     JUDGE_MAX_CONCURRENCY: int = int(os.getenv("JUDGE_MAX_CONCURRENCY", "2"))

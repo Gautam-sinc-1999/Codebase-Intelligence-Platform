@@ -235,3 +235,40 @@ def test_graph_items_score_full_recall_against_the_real_graph():
     assert summary["failed"] == 0, summary["failures"]
     assert summary["metrics"]["graph_caller_recall"] == 1.0
     assert summary["metrics"]["graph_caller_precision"] == 1.0
+
+
+# ------------------------------------------------------------------ answer mode is async
+
+async def test_answer_mode_works_from_inside_a_running_event_loop():
+    """
+    Found live, and only live: the RAGAS harness is async, and `_answer_output` used
+    `asyncio.run` — which raises "cannot be called from a running event loop" the moment the
+    caller already has one. Every test until now exercised `facts` mode end to end and `answer`
+    mode only through synthetic output dicts, so the one path that mattered was never run.
+
+    This test is `async` on purpose: in a sync test the old code would have passed.
+    """
+    with runner.GraphFixture("eval_async_probe") as fixture:
+        item = ds.graph_items()[0]
+        output = await runner.aexecute(item["input"], item["metadata"],
+                                       mode="answer", fixture=fixture)
+
+    assert output["mode"] == "answer"
+    assert isinstance(output["answer"], str) and output["answer"].strip()
+    # The graph half must still be right regardless of what the model wrote.
+    assert set(output["callers"]) == set(ds.GRAPH_EXPECTED_CALLERS)
+
+
+async def test_the_sync_execute_refuses_answer_mode_rather_than_breaking():
+    """A clear error beats "cannot be called from a running event loop" three frames deep."""
+    with runner.GraphFixture("eval_sync_refusal") as fixture:
+        item = ds.graph_items()[0]
+        with pytest.raises(ValueError, match="aexecute"):
+            runner.execute(item["input"], item["metadata"], mode="answer", fixture=fixture)
+
+
+async def test_aexecute_still_handles_facts_mode():
+    """The async form must cover both, or callers need to know which to use when."""
+    output = await runner.aexecute({"query": "Where is authentication implemented?"},
+                                   {"check": "intent"})
+    assert output["intent"] == "CODE_LOCATION"

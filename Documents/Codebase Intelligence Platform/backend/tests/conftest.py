@@ -54,6 +54,18 @@ except Exception:
 os.environ["DATA_DIR"] = os.path.join(_TEST_ROOT, "data")
 os.environ["CHROMADB_DIR"] = os.path.join(_TEST_ROOT, "chroma")
 
+# Tracing off for the suite, regardless of what backend/.env holds.
+#
+# Once real Langfuse keys existed, every test began shipping traces to the live project: the
+# run slowed by roughly 10x and the dashboard filled with hundreds of fixture traces, drowning
+# the real ones it exists to show. Nothing is lost by disabling it — the tests that exercise
+# tracing install their own recording client with monkeypatch and never consult these keys.
+# Set to empty rather than deleted: `app.core.config` loads backend/.env with
+# `os.environ.setdefault`, so a deleted key is simply restored the moment anything imports it —
+# which `app.observability.tracing` does. An empty value survives, and reads as "not configured".
+os.environ["LANGFUSE_PUBLIC_KEY"] = ""
+os.environ["LANGFUSE_SECRET_KEY"] = ""
+
 # A dedicated database, dropped at the end of the session.
 #
 # Isolating only the filesystem was not enough once MongoDB was running: repository records

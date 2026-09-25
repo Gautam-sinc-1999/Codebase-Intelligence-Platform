@@ -60,7 +60,7 @@ def run_local(dataset_names, mode: str) -> int:
     return 1 if failed else 0
 
 
-def run_against_langfuse(dataset_names, mode: str, run_name: str) -> int:
+def run_against_langfuse(dataset_names, mode: str, run_name: str, concurrency: int) -> int:
     """
     Pulls items from Langfuse and links the results to a named dataset run.
 
@@ -84,9 +84,10 @@ def run_against_langfuse(dataset_names, mode: str, run_name: str) -> int:
         for name in dataset_names:
             dataset = client.get_dataset(name)
 
-            def task(*, item, **_kwargs):
-                return runner.execute(item.input, item.metadata or {},
-                                      mode=mode, fixture=fixture)
+            # Async because `answer` mode awaits the orchestrator; the SDK accepts either.
+            async def task(*, item, **_kwargs):
+                return await runner.aexecute(item.input, item.metadata or {},
+                                             mode=mode, fixture=fixture)
 
             def evaluator(*, input, output, expected_output, metadata, **_kwargs):
                 return [
@@ -96,9 +97,16 @@ def run_against_langfuse(dataset_names, mode: str, run_name: str) -> int:
 
             result = dataset.run_experiment(
                 name=run_name,
+                # Passed explicitly: `name` alone makes Langfuse append an ISO timestamp, so
+                # runs could never be compared by a name you chose.
+                run_name=run_name,
                 description=f"{name} via scripts/run_dataset.py (mode: {mode})",
                 task=task,
                 evaluators=[evaluator],
+                # The SDK default is 50. Against a local single-node Langfuse that floods
+                # ingestion and items fail to link with "timed out" — while the run itself
+                # reports success, because the work was done and only the recording was lost.
+                max_concurrency=concurrency,
                 metadata={"mode": mode},
             )
 
@@ -141,6 +149,8 @@ def main() -> int:
                         help="limit to one dataset (repeatable)")
     parser.add_argument("--run-name", default=None,
                         help="name for the dataset run; defaults to a timestamp")
+    parser.add_argument("--concurrency", type=int, default=4,
+                        help="parallel items when linking to Langfuse (default 4)")
     args = parser.parse_args()
 
     names = args.dataset or sorted(ds.DATASETS)
@@ -149,7 +159,7 @@ def main() -> int:
 
     from datetime import datetime
     run_name = args.run_name or f"{args.mode}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    return run_against_langfuse(names, args.mode, run_name)
+    return run_against_langfuse(names, args.mode, run_name, args.concurrency)
 
 
 if __name__ == "__main__":

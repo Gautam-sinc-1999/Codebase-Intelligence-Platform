@@ -143,18 +143,31 @@ def graph_precision(answer: str, graph_callers: List[Dict[str, Any]],
     return round(correct / len(claimed), 4)
 
 
-def path_grounding(answer: str, sources: List[Dict[str, Any]]) -> Optional[float]:
+def path_grounding(answer: str, sources: List[Dict[str, Any]],
+                   graph_callers: Optional[List[Dict[str, Any]]] = None) -> Optional[float]:
     """
-    Proportion of file paths in the answer that were actually in the retrieved context.
+    Proportion of file paths in the answer that the model was actually shown.
 
     A cheap proxy for faithfulness: a path the model never saw is a path it invented. Not a
     substitute for RAGAS faithfulness, which reasons about claims rather than strings.
+
+    **The graph facts count as "shown", not just the retrieved snippets.** The prompt puts two
+    things in front of the model, and rule A1 instructs it to report the complete caller list from
+    the facts even when the snippets show fewer. Scoring against snippets alone therefore punished
+    the model for obeying the prompt: a verified-correct answer naming all thirteen callers, of
+    which retrieval returned six, scored 0.38 and read as heavy hallucination. A correctness
+    metric that fires on correct behaviour is worse than no metric — it sends you looking for a
+    bug that is not there, or worse, "fixing" the prompt until the answer gets wronger.
     """
     mentioned = _cited_paths(answer)
     if not mentioned:
         return None
+
     provided = {s.get("file_path") for s in (sources or [])}
-    grounded = sum(1 for p in mentioned if any(p in (q or "") or (q or "") in p for q in provided))
+    provided |= {c.get("file_path") for c in (graph_callers or [])}
+    provided = {p for p in provided if p}
+
+    grounded = sum(1 for p in mentioned if any(p in q or q in p for q in provided))
     return round(grounded / len(mentioned), 4)
 
 
@@ -217,7 +230,7 @@ def collect(
 
     put("citation_validity", citation_validity(sources, all_chunks))
     put("citation_line_validity", citation_line_validity(sources, all_chunks))
-    put("path_grounding", path_grounding(answer, sources))
+    put("path_grounding", path_grounding(answer, sources, graph_callers))
     put("retrieval_hit", retrieval_hit(target_symbol, sources))
     put("prompt_budget_used", prompt_budget_used(prompt_chars, budget_chars))
     scores["degraded"] = bool(degraded)

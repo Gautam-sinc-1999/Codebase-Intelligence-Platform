@@ -144,3 +144,14 @@ The main limitations I identified were that MiniLM is not code-specific, retriev
 
 Best regards,
 Gautam Koshta
+
+
+CONTAINER ID   IMAGE                               COMMAND                  CREATED        STATUS                  PORTS                                         NAMES
+37c001a37f54   langfuse/langfuse:3                 "dumb-init -- ./web/…"   25 hours ago   Up 25 hours             127.0.0.1:3001->3000/tcp                      ci-langfuse
+0e9772e361f2   langfuse/langfuse-worker:3          "dumb-init -- ./work…"   25 hours ago   Up 25 hours             3030/tcp                                      ci-langfuse-worker
+4262ac2bf574   postgres:16-alpine                  "docker-entrypoint.s…"   25 hours ago   Up 25 hours (healthy)   5432/tcp                                      ci-langfuse-db
+739e0fc05b01   clickhouse/clickhouse-server:24.3   "/entrypoint.sh"         25 hours ago   Up 25 hours (healthy)   8123/tcp, 9000/tcp, 9009/tcp                  ci-langfuse-clickhouse
+f0e48df640d3   quay.io/minio/minio:latest          "sh -c 'mkdir -p /da…"   25 hours ago   Up 25 hours             9000/tcp                                      ci-langfuse-minio
+e5d16c99c0d0   dpage/pgadmin4:latest               "/entrypoint.sh"         5 months ago   Up 25 hours             0.0.0.0:5050->80/tcp, [::]:5050->80/tcp       pgadmin
+2dcab6a5b8cb   expensetracker-mcp_server           "python server.py"       5 months ago   Up 25 hours (healthy)   0.0.0.0:8000->8000/tcp, [::]:8000->8000/tcp   expense_mcp_server
+b774cbc39460   postgres:16                         "docker-entrypoint.s…"   5 months ago   Up 25 hours (healthy)   0.0.0.0:5433->5432/tcp, [::]:5433->5432/tcp   postgres_db

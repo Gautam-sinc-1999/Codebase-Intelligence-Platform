@@ -106,21 +106,23 @@ services:
       start_period: 30s
 
   langfuse-minio:
-    image: minio/minio:latest
+    # Quay, not Docker Hub: `minio/minio:latest` no longer resolves there and the pull fails
+    # with "repository does not exist", which reads like an auth problem and is not one.
+    image: quay.io/minio/minio:latest
     container_name: ci-langfuse-minio
     profiles: ["observability"]
     restart: unless-stopped
-    command: server /data --console-address ":9001"
+    # The bucket has to exist before Langfuse uploads to it, and MinIO has no "create on write".
+    # A directory under /data *is* a bucket, so making it at boot is the whole setup step.
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server /data --address ":9000" --console-address ":9001"'
     environment:
       MINIO_ROOT_USER: minio
       MINIO_ROOT_PASSWORD: miniosecret
     volumes:
       - langfuse-minio-data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "mc ready local || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
+    # No healthcheck: the server image ships no `mc` or `curl` to probe with, and nothing here
+    # gates on it being healthy — the dependents below wait for `service_started`.
 
   langfuse:
     image: langfuse/langfuse:3
@@ -140,6 +142,11 @@ services:
       CLICKHOUSE_USER: clickhouse
       CLICKHOUSE_PASSWORD: clickhouse
       CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      # Single-node ClickHouse. Langfuse's migrations otherwise create ReplicatedMergeTree
+      # tables `ON CLUSTER default`, which need a ZooKeeper/Keeper quorum — so both containers
+      # crash-loop on "There is no Zookeeper configuration in server config". The error text
+      # blames an unreachable database or a password needing URL-encoding; it is neither.
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
       LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
       LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
       LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
@@ -149,9 +156,52 @@ services:
       REDIS_CONNECTION_STRING: redis://redis:6379
       # Development defaults. Generate real values before exposing this anywhere.
       NEXTAUTH_URL: http://localhost:3001
-      NEXTAUTH_SECRET: dev-only-change-me
-      SALT: dev-only-change-me
-      ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      NEXTAUTH_SECRET: "15158443822ce22de3d8595c19c564da1a698641bbc59f94c537ca88aa821217"
+      SALT: "63a4a2e0541082345a5635afe3627e91"
+      # QUOTED, and this matters: 64 unquoted zeros are valid YAML for the integer 0, so
+      # Compose passed ENCRYPTION_KEY="0" and Langfuse rejected it as "must be 64 hex
+      # characters" while the file plainly showed 64 of them. Generated via openssl rand -hex 32.
+      ENCRYPTION_KEY: "3d0ccda553501c8f6d1ac73e5c37fb2733a711cf1dc238c54b77821e942b2827"
+      TELEMETRY_ENABLED: "false"
+
+  # Langfuse v3 is two processes, not one. The web container accepts ingestion and queues it;
+  # this drains the queue into ClickHouse. Without it the UI comes up perfectly and traces
+  # simply never appear — events pile up in Redis with nothing reading them, and there is no
+  # error anywhere to explain it.
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    container_name: ci-langfuse-worker
+    profiles: ["observability"]
+    restart: unless-stopped
+    depends_on:
+      langfuse-db: {condition: service_healthy}
+      langfuse-clickhouse: {condition: service_healthy}
+      langfuse-minio: {condition: service_started}
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      # Single-node ClickHouse. Langfuse's migrations otherwise create ReplicatedMergeTree
+      # tables `ON CLUSTER default`, which need a ZooKeeper/Keeper quorum — so both containers
+      # crash-loop on "There is no Zookeeper configuration in server config". The error text
+      # blames an unreachable database or a password needing URL-encoding; it is neither.
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      REDIS_CONNECTION_STRING: redis://redis:6379
+      # Must match the web container exactly: these key the encrypted fields and hashed API
+      # keys in Postgres, so a mismatch makes the worker unable to read what the web wrote.
+      SALT: "63a4a2e0541082345a5635afe3627e91"
+      # QUOTED, and this matters: 64 unquoted zeros are valid YAML for the integer 0, so
+      # Compose passed ENCRYPTION_KEY="0" and Langfuse rejected it as "must be 64 hex
+      # characters" while the file plainly showed 64 of them. Generated via openssl rand -hex 32.
+      ENCRYPTION_KEY: "3d0ccda553501c8f6d1ac73e5c37fb2733a711cf1dc238c54b77821e942b2827"
       TELEMETRY_ENABLED: "false"
 
 volumes:
